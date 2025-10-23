@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import time
 from tqdm.auto import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from utils.helpers import trim_orderbook
+from utils.helpers import trim_orderbook, standardize_orderbook_columns
 
 BASE_URL = "https://www.okx.com/api/v5/public/market-data-history"
 
@@ -88,45 +88,43 @@ def fetch_market_data(
             continue
         
         # Parse response and download CSVs
-        if 'data' in data and data['data']:
-            # Collect all CSV URLs and sizes
-            urls = []
-            for data_item in data['data']:
-                if 'details' not in data_item:
-                    continue
-                for detail in data_item['details']:
-                    if 'groupDetails' not in detail:
-                        continue
-                    for group in detail['groupDetails']:
-                        if 'url' in group:
-                            urls.append(group['url'])
-                            # Track size if available
-                            if 'sizeMB' in group:
-                                total_size_mb += float(group['sizeMB'])
+        download_info = []
+        
+        # Process group details
+        for group in data['data'][0]['details'][0]['groupDetails']:
+            download_info.append({
+                'url': group['url'],
+                'filename': group['filename']
+            })
+            if 'sizeMB' in group:
+                total_size_mb += float(group['sizeMB'])
+        
+        total_downloads += len(download_info)
             
-            total_downloads += len(urls)
-            
-            if verbose:
-                print(f"Fetch #{i+1}/{len(ranges)}: {len(urls)} files found | Total: {total_downloads} files, {total_size_mb:.2f} MB")
-            
-            # Download CSVs with progress bar
-            def download_csv(url, module):
-                try:
-                    if int(module) == 6:
-                        return trim_orderbook(pd.read_csv(url, compression='gzip'), depth)
-                    else:
-                        return pd.read_csv(url)
-                except Exception as e:
-                    print(f"Error downloading CSV: {e}")
-                    print(f"URL: {url}")
-                    return None
+        if verbose:
+            print(f"Fetch #{i+1}/{len(ranges)}: {len(download_info)} files found | Total: {total_downloads} files, {total_size_mb:.2f} MB")
+        
+        # Download CSVs with progress bar
+        def download_csv(info, module):
+            try:
+                if int(module) == 6:
+                    if inst_type == 'FUTURES':
+                        return trim_orderbook(standardize_orderbook_columns(pd.read_csv(info['url'], compression='gzip'), filename=info['filename']), depth)
+                    return trim_orderbook(pd.read_csv(info['url'], compression='gzip'), depth)
+                else:
+                    return pd.read_csv(info['url'])
+            except Exception as e:
+                print(f"Error downloading CSV: {e}")
+                print(f"URL: {info['url']}")
+                print(f"Filename: {info['filename']}")
+                return None
 
-            with ThreadPoolExecutor(max_workers=32) as executor:
-                futures = [executor.submit(download_csv, url, module) for url in urls]
-                for future in tqdm(as_completed(futures), total=len(urls), desc="Downloading CSVs", disable=not verbose, leave=False):
-                    df = future.result()
-                    if df is not None:
-                        all_dfs.append(df)
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            futures = [executor.submit(download_csv, info, module) for info in download_info]
+            for future in tqdm(as_completed(futures), total=len(download_info), desc="Downloading CSVs", disable=not verbose, leave=False):
+                df = future.result()
+                if df is not None:
+                    all_dfs.append(df)
         
         if i < len(ranges) - 1:
             time.sleep(delay)

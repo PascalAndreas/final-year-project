@@ -21,9 +21,35 @@ def get_option_combos(df: pd.DataFrame):
     
     return combos_df.drop_duplicates().sort_values(['expiry', 'strike']).reset_index(drop=True)
 
+def standardize_orderbook_columns(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    """
+    Standardize orderbook column names from FUTURES format to OPTIONS format.
+    E.g. askPx1 -> ask_1_px, bidSz2 -> bid_2_sz
+    Also adds a symbol column from the filename.
+    """
+    # Add symbol column from filename
+    symbol = filename.split('.csv.gz')[0]
+    df['symbol'] = symbol
+    
+    # Standardize column names
+    rename_map = {}
+    for col in df.columns:
+        if col.startswith(('ask', 'bid')):
+            num_str = ''.join(filter(str.isdigit, col))
+            if not num_str:
+                continue
+            
+            side = col[:3]
+            col_type = col[3:-len(num_str)].lower()
+            rename_map[col] = f"{side}_{num_str}_{col_type}"
+            
+    return df.rename(columns=rename_map)
 
 def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
-    # Keep non-orderbook columns and orderbook columns up to n_levels
+    """
+    Trim orderbook DataFrame to keep only top n levels.
+    Expects OPTIONS format column names (ask_1_px, bid_1_px, etc.)
+    """
     cols_to_keep = [
         col for col in df.columns
         if not any(col.startswith(f'{side}_') for side in ['ask', 'bid']) or

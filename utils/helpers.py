@@ -25,7 +25,10 @@ def parse_option_name(instrument_name: str):
     if len(parts) != 5:
         raise ValueError(f"Invalid instrument name format: {instrument}")
     
-    return f"{parts[0]}-{parts[1]}", datetime.strptime(parts[2], '%y%m%d'), int(parts[3]), parts[4].upper()
+    # Parse date and set expiry time to 08:00 UTC (timezone-naive for pandas compatibility)
+    expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0)
+    
+    return f"{parts[0]}-{parts[1]}", expiry_datetime, int(parts[3]), parts[4].upper()
 
 def parse_future_name(instrument_name: str):
     # Remove file extension if present (e.g., 'BTC-USD-250131.OK' -> 'BTC-USD-250131')
@@ -33,7 +36,11 @@ def parse_future_name(instrument_name: str):
     parts = instrument.split('-')
     if len(parts) != 3:
         raise ValueError(f"Invalid instrument name format: {instrument}")
-    return f"{parts[0]}-{parts[1]}", datetime.strptime(parts[2], '%y%m%d')
+    
+    # Parse date and set expiry time to 08:00 UTC (timezone-naive for pandas compatibility)
+    expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0)
+    
+    return f"{parts[0]}-{parts[1]}", expiry_datetime
 
 def get_option_combos(df: pd.DataFrame):
     # Extract expiry/strike pairs from valid instruments
@@ -88,14 +95,22 @@ def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
     Expects OPTIONS format column names (ask_1_px, bid_1_px, etc.)
     """
     if n_levels == 0:
-        # Simple mid price from top bid and ask
-        df['mid_price'] = (df['bid_1_px'] + df['ask_1_px']) / 2
+        # Return empty if required columns don't exist
+        if 'bid_1_px' not in df.columns or 'ask_1_px' not in df.columns:
+            base_cols = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
+            return pd.DataFrame(columns=base_cols + ['mid_price'])
         
-        # Keep only non-orderbook columns plus mid_price
-        cols_to_keep = [
-            col for col in df.columns
-            if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])
-        ]
+        # Filter out rows with NaN bid or ask
+        df = df[df['bid_1_px'].notna() & df['ask_1_px'].notna()].copy()
+        
+        # Return empty if no valid rows
+        if df.empty:
+            base_cols = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
+            return pd.DataFrame(columns=base_cols + ['mid_price'])
+        
+        # Calculate mid price and keep only non-orderbook columns
+        df['mid_price'] = (df['bid_1_px'] + df['ask_1_px']) / 2
+        cols_to_keep = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
         return df[cols_to_keep]
     
     # Standard trimming to n levels

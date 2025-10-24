@@ -13,22 +13,22 @@ from tqdm.auto import tqdm
 import plotly.graph_objects as go
 
 from .api import fetch_market_data
-from .black import black76_implied_volatility
+from .black import black76_implied_volatility, black76_implied_volatility_vectorized
 from .helpers import parse_option_name, parse_future_name, bin_orderbook
 
 def _process_futures(futures_df: pd.DataFrame) -> pd.DataFrame:
     """Process binned futures to get forward prices by expiry and time.
-    Assumes orderbook is already binned."""
+    Assumes orderbook is already binned and mid_price is calculated."""
     if futures_df.empty:
         return pd.DataFrame(columns=['timestamp', 'expiry', 'forward_price'])
     
-    # Parse expiries and compute forward prices
+    # Parse expiries and use mid_price as forward price
     futures_df['expiry'] = futures_df['symbol'].apply(lambda x: parse_future_name(x)[1])
     
     return pd.DataFrame({
         'timestamp': futures_df['timestamp'],
         'expiry': futures_df['expiry'],
-        'forward_price': (futures_df['bid_1_px'] + futures_df['ask_1_px']) / 2
+        'forward_price': futures_df['mid_price']
     })
 
 
@@ -36,15 +36,14 @@ def _compute_option_iv(options_df: pd.DataFrame, forward_prices: pd.DataFrame,
                        risk_free_rate: float = 0.0, verbose: bool = False, 
                        diagnostics: bool = False) -> pd.DataFrame:
     """Compute implied volatility for binned options using forward prices.
-    Assumes orderbook is already binned."""
+    Assumes orderbook is already binned and mid_price is calculated."""
     if options_df.empty or forward_prices.empty:
         return pd.DataFrame()
     
-    # Parse option instruments and compute mid prices
+    # Parse option instruments (mid_price already calculated in trim_orderbook)
     options_df[['inst_family', 'expiry', 'strike', 'option_type']] = pd.DataFrame(
         options_df['symbol'].apply(parse_option_name).tolist(), index=options_df.index
     )
-    options_df['mid'] = (options_df['bid_1_px'] + options_df['ask_1_px']) / 2
     
     # Merge with forward prices
     df = options_df.merge(
@@ -64,61 +63,30 @@ def _compute_option_iv(options_df: pd.DataFrame, forward_prices: pd.DataFrame,
     valid = (df['tenor_days'] > 0) & (df['strike'] > 0) & (df['forward_price'] > 0)
     df = df[valid].copy()
     
-    # Apply IV calculation (only non-vectorizable part)
-    failure_reasons = []
+    # Convert option price from BTC to USD by multiplying by forward price
+    df['market_price_usd'] = df['mid_price'] * df['forward_price']
     
-    def calc_iv(row):
-        try:
-            iv = black76_implied_volatility(
-                market_price=row['mid'],
-                F=row['forward_price'],
-                K=row['strike'],
-                T=row['tenor_days'] / 365.25,  # Convert days to years for Black-76
-                r=risk_free_rate,
-                option_type=row['option_type']
-            )
-            if diagnostics and np.isnan(iv):
-                # Diagnose why IV is NaN
-                intrinsic = max(row['forward_price'] - row['strike'], 0) if row['option_type'] == 'C' else max(row['strike'] - row['forward_price'], 0)
-                if row['mid'] < intrinsic * 0.99:
-                    failure_reasons.append(('below_intrinsic', row['mid'], intrinsic, row['strike'], row['forward_price'], row['option_type']))
-                else:
-                    failure_reasons.append(('no_solution', row['mid'], intrinsic, row['strike'], row['forward_price'], row['option_type']))
-            return iv
-        except (ValueError, ZeroDivisionError) as e:
-            if diagnostics:
-                failure_reasons.append(('exception', str(e), None, row['strike'], row['forward_price'], row['option_type']))
-            return np.nan
+    # Vectorized IV calculation
+    df['implied_vol'] = black76_implied_volatility_vectorized(
+        market_price=df['market_price_usd'].values,
+        F=df['forward_price'].values,
+        K=df['strike'].values,
+        T=(df['tenor_days'] / 365.25).values,  # Convert days to years for Black-76
+        r=risk_free_rate,
+        option_type=df['option_type'].values,
+        verbose=diagnostics  # Pass diagnostics flag to solver
+    )
     
-    df['implied_vol'] = df.apply(calc_iv, axis=1)
-    
-    # Filter out failed IV calculations
+    # Report failed IV calculations
     failed_count = df['implied_vol'].isna().sum()
     if verbose and failed_count > 0:
         print(f"    Failed IV calculations: {failed_count}/{len(df)}")
-    
-    if diagnostics and failure_reasons:
-        print(f"\n    Failure Diagnostics:")
-        below_intrinsic = [r for r in failure_reasons if r[0] == 'below_intrinsic']
-        no_solution = [r for r in failure_reasons if r[0] == 'no_solution']
-        exceptions = [r for r in failure_reasons if r[0] == 'exception']
-        
-        print(f"      Below intrinsic value: {len(below_intrinsic)} ({len(below_intrinsic)/len(failure_reasons)*100:.1f}%)")
-        print(f"      No solution in [0.01, 10]: {len(no_solution)} ({len(no_solution)/len(failure_reasons)*100:.1f}%)")
-        print(f"      Exceptions: {len(exceptions)} ({len(exceptions)/len(failure_reasons)*100:.1f}%)")
-        
-        if below_intrinsic:
-            sample = below_intrinsic[0]
-            print(f"      Sample below intrinsic: mid={sample[1]:.2f}, intrinsic={sample[2]:.2f}, K={sample[3]:.0f}, F={sample[4]:.0f}, type={sample[5]}")
-        if no_solution:
-            sample = no_solution[0]
-            print(f"      Sample no solution: mid={sample[1]:.2f}, intrinsic={sample[2]:.2f}, K={sample[3]:.0f}, F={sample[4]:.0f}, type={sample[5]}")
     
     df = df.dropna(subset=['implied_vol'])
     
     return df[[
         'timestamp', 'symbol', 'expiry', 'strike', 'option_type',
-        'mid', 'forward_price', 'tenor_days', 'log_moneyness', 'implied_vol'
+        'mid_price', 'forward_price', 'tenor_days', 'log_moneyness', 'implied_vol'
     ]]
 
 
@@ -141,10 +109,11 @@ def construct_iv_surface(
     for date in tqdm(dates_to_fetch, desc="Processing dates", disable=not verbose):
         day_end = date + timedelta(days=1) - timedelta(seconds=1)
         
-        # Step 1: Fetch futures orderbook (bin immediately to reduce memory)
+        # Step 1: Fetch futures orderbook (depth=0 to get mid_price only)
         futures_df = fetch_market_data(
             '6', 'FUTURES', inst_family, date, day_end, 'daily', 
             verbose=verbose,
+            depth=0,
             process_fn=lambda df: bin_orderbook(df, f'{time_step_minutes}min')
         )
         
@@ -166,6 +135,7 @@ def construct_iv_surface(
         options_df = fetch_market_data(
             '6', 'OPTION', inst_family, date, day_end, 'daily', 
             verbose=verbose,
+            depth=0,
             include_criterion=filter_by_expiry,
             process_fn=lambda df: bin_orderbook(df, f'{time_step_minutes}min')
         )
@@ -220,9 +190,6 @@ def create_iv_surface_plot(
     # Get unique timestamps (data is already binned by construct_iv_surface)
     unique_times = sorted(iv_df['datetime'].unique())
     
-    # Get unique expiries for custom tenor axis labels
-    unique_tenors_days = sorted(iv_df['tenor_days'].unique())
-    
     # Compute fixed axis ranges across all data (prevents jumpy axes)
     x_min, x_max = iv_df['log_moneyness'].quantile([0.01, 0.99])
     y_min, y_max = iv_df['tenor_days'].quantile([0.01, 0.99])
@@ -230,13 +197,13 @@ def create_iv_surface_plot(
     
     # Add padding to ranges
     x_range = x_max - x_min
-    y_range = y_max - y_min
     z_range = z_max - z_min
     
     x_min -= x_range * 0.05
     x_max += x_range * 0.05
-    y_min = max(0, y_min - y_range * 0.05)
-    y_max += y_range * 0.05
+    # For log scale, use multiplicative padding
+    y_min = max(0.1, y_min * 0.9)  # Ensure positive for log scale
+    y_max = y_max * 1.1
     z_min = max(0, z_min - z_range * 0.05)
     z_max += z_range * 0.05
     
@@ -247,8 +214,15 @@ def create_iv_surface_plot(
         
         if len(bin_data) < 3:
             frames.append(go.Frame(
-                data=[go.Surface(x=[], y=[], z=[], showscale=False)],
-                name=str(time_val)
+                data=[
+                    go.Surface(x=[], y=[], z=[], showscale=False, name='IV Surface'),
+                    go.Scatter3d(x=[], y=[], z=[], mode='markers', name='Data Points')
+                ],
+                name=str(time_val),
+                layout=dict(
+                    scene_yaxis_tickvals=[],
+                    scene_yaxis_ticktext=[]
+                )
             ))
             continue
         
@@ -257,8 +231,15 @@ def create_iv_surface_plot(
         
         if log_m_grid is None:
             frames.append(go.Frame(
-                data=[go.Surface(x=[], y=[], z=[], showscale=False)],
-                name=str(time_val)
+                data=[
+                    go.Surface(x=[], y=[], z=[], showscale=False, name='IV Surface'),
+                    go.Scatter3d(x=[], y=[], z=[], mode='markers', name='Data Points')
+                ],
+                name=str(time_val),
+                layout=dict(
+                    scene_yaxis_tickvals=[],
+                    scene_yaxis_ticktext=[]
+                )
             ))
             continue
         
@@ -271,13 +252,49 @@ def create_iv_surface_plot(
             cmin=z_min,
             cmax=z_max,
             colorbar=dict(title="IV", x=1.02),
-            showscale=True
+            showscale=True,
+            name='IV Surface'
         )
         
-        frames.append(go.Frame(data=[surface], name=str(time_val)))
+        # Create scatter points for actual data
+        scatter = go.Scatter3d(
+            x=bin_data['log_moneyness'],
+            y=bin_data['tenor_days'],
+            z=bin_data['implied_vol'],
+            mode='markers',
+            marker=dict(
+                size=3,
+                color='red',
+                symbol='circle'
+            ),
+            name='Data Points'
+        )
+        
+        # Get unique tenors for this frame only
+        frame_tenors = sorted(bin_data['tenor_days'].unique())
+        frame_tenor_labels = [f"{t:.2f}" for t in frame_tenors]
+        
+        frames.append(go.Frame(
+            data=[surface, scatter], 
+            name=str(time_val),
+            layout=dict(
+                scene_yaxis_tickvals=frame_tenors,
+                scene_yaxis_ticktext=frame_tenor_labels
+            )
+        ))
     
-    # Create figure
+    # Create figure with initial frame data and layout
+    initial_layout = frames[0].layout if frames and hasattr(frames[0], 'layout') else None
     fig = go.Figure(data=frames[0].data if frames else [], frames=frames)
+    
+    # Get initial tenor ticks from first frame
+    initial_tenors = []
+    initial_tenor_labels = []
+    if frames and len(frames[0].data) > 0:
+        first_bin_data = iv_df[iv_df['datetime'] == unique_times[0]]
+        if not first_bin_data.empty:
+            initial_tenors = sorted(first_bin_data['tenor_days'].unique())
+            initial_tenor_labels = [f"{t:.2f}" for t in initial_tenors]
     
     fig.update_layout(
         title=title,
@@ -287,10 +304,11 @@ def create_iv_surface_plot(
             zaxis_title='Implied Volatility',
             xaxis=dict(range=[x_min, x_max]),
             yaxis=dict(
-                range=[y_min, y_max],  # Already in days
+                type='log',  # Logarithmic scale
+                range=[np.log10(y_min), np.log10(y_max)],
                 tickmode='array',
-                tickvals=unique_tenors_days,
-                ticktext=[f"{int(t)}" for t in unique_tenors_days]
+                tickvals=initial_tenors,
+                ticktext=initial_tenor_labels
             ),
             zaxis=dict(range=[z_min, z_max]),
             camera=dict(eye=dict(x=1.5, y=1.5, z=1.3))

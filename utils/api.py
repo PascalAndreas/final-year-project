@@ -50,7 +50,10 @@ def fetch_market_data(
     date_aggr_type: str = 'daily',
     delay: float = 0.2,
     depth: int = 5,
-    verbose: bool = True
+    verbose: bool = True,
+    include_criterion: callable = None,
+    process_fn: callable = None,
+    max_workers: int = 32
 ) -> pd.DataFrame:
     # Create date chunks based on API timezone and limits
     ranges = _create_date_chunks(start_date, end_date, module, date_aggr_type)
@@ -92,6 +95,16 @@ def fetch_market_data(
         
         # Process group details
         for group in data['data'][0]['details'][0]['groupDetails']:
+            # Apply include_criterion filter if provided
+            if include_criterion is not None:
+                if not include_criterion(group['filename']):
+                    continue
+            # Default behavior for futures - filter by filename prefix
+            elif inst_type == 'FUTURES':
+                # Only include files that start with the specified instrument family
+                if not group['filename'].startswith(f"{inst_family_list}-"):
+                    continue
+            
             download_info.append({
                 'url': group['url'],
                 'filename': group['filename']
@@ -109,17 +122,25 @@ def fetch_market_data(
             try:
                 if int(module) == 6:
                     if inst_type == 'FUTURES':
-                        return trim_orderbook(standardize_orderbook_columns(pd.read_csv(info['url'], compression='gzip'), filename=info['filename']), depth)
-                    return trim_orderbook(pd.read_csv(info['url'], compression='gzip'), depth)
+                        df = standardize_orderbook_columns(pd.read_csv(info['url'], compression='gzip'), filename=info['filename'])
+                    else:
+                        df = pd.read_csv(info['url'], compression='gzip')
+                    df = trim_orderbook(df, depth)
                 else:
-                    return pd.read_csv(info['url'])
+                    df = pd.read_csv(info['url'])
+                
+                # Apply post-processing function if provided
+                if process_fn is not None:
+                    df = process_fn(df)
+
+                return df
             except Exception as e:
                 print(f"Error downloading CSV: {e}")
                 print(f"URL: {info['url']}")
                 print(f"Filename: {info['filename']}")
                 return None
 
-        with ThreadPoolExecutor(max_workers=32) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(download_csv, info, module) for info in download_info]
             for future in tqdm(as_completed(futures), total=len(download_info), desc="Downloading CSVs", disable=not verbose, leave=False):
                 df = future.result()

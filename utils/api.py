@@ -120,17 +120,29 @@ def fetch_market_data(
         # Download CSVs with progress bar
         def download_csv(info, module):
             try:
-                if int(module) == 6:
-                    if inst_type == 'FUTURES':
-                        df = standardize_orderbook_columns(pd.read_csv(info['url'], compression='gzip'), filename=info['filename'])
-                    else:
-                        df = pd.read_csv(info['url'], compression='gzip')
-                    df = trim_orderbook(df, depth)
-                else:
+                if int(module) == 6: # Module 6 uses chunked reading with native pandas gzip handling
+                    chunk_iterator = pd.read_csv(
+                        info['url'], 
+                        compression='gzip',
+                        chunksize=100000
+                    )
+                    
+                    trimmed_chunks = []
+                    for chunk in chunk_iterator:
+                        # Standardize columns if needed (must be done before trim)
+                        if inst_type == 'FUTURES':
+                            chunk = standardize_orderbook_columns(chunk, filename=info['filename'])
+                        
+                        # Trim orderbook immediately to reduce memory
+                        chunk = trim_orderbook(chunk, depth)
+                        trimmed_chunks.append(chunk)
+                    
+                    # Combine trimmed chunks
+                    df = pd.concat(trimmed_chunks, ignore_index=True)
+                else: # Module != 6 doesn't use gzip, process normally
                     df = pd.read_csv(info['url'])
                 
-                # Apply post-processing function if provided
-                if process_fn is not None:
+                if process_fn is not None: # Apply post-processing function if provided
                     df = process_fn(df)
 
                 return df

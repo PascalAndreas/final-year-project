@@ -84,8 +84,21 @@ def standardize_orderbook_columns(df: pd.DataFrame, filename: str) -> pd.DataFra
 def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
     """
     Trim orderbook DataFrame to keep only top n levels.
+    If n_levels=0, calculates simple mid price (bid_1 + ask_1) / 2 and drops all orderbook columns.
     Expects OPTIONS format column names (ask_1_px, bid_1_px, etc.)
     """
+    if n_levels == 0:
+        # Simple mid price from top bid and ask
+        df['mid_price'] = (df['bid_1_px'] + df['ask_1_px']) / 2
+        
+        # Keep only non-orderbook columns plus mid_price
+        cols_to_keep = [
+            col for col in df.columns
+            if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])
+        ]
+        return df[cols_to_keep]
+    
+    # Standard trimming to n levels
     cols_to_keep = [
         col for col in df.columns
         if not any(col.startswith(f'{side}_') for side in ['ask', 'bid']) or

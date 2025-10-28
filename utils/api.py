@@ -72,11 +72,16 @@ def fetch_market_data(
         params = {
             'module': str(module),
             'instType': inst_type,
-            'instFamilyList': inst_family_list,
             'dateAggrType': date_aggr_type,
             'begin': str(begin_ms),
             'end': str(end_ms)
         }
+        
+        # Assign to instIdList for SPOT, otherwise instFamilyList
+        if inst_type == 'SPOT':
+            params['instIdList'] = inst_family_list
+        else:
+            params['instFamilyList'] = inst_family_list
         
         response = requests.get(BASE_URL, params=params)
         

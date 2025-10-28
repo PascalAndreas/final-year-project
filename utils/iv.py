@@ -8,21 +8,21 @@ and creates interactive 3D surface plots with time slider.
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from scipy.interpolate import griddata
 from tqdm.auto import tqdm
 import plotly.graph_objects as go
+from scipy.interpolate import RBFInterpolator
+import warnings
+import time
 
 from .api import fetch_market_data
 from .black import black76_implied_volatility, black76_implied_volatility_vectorized
 from .helpers import parse_option_name, parse_future_name, bin_orderbook
 
 def _process_futures(futures_df: pd.DataFrame) -> pd.DataFrame:
-    """Process binned futures to get forward prices by expiry and time.
-    Assumes orderbook is already binned and mid_price is calculated."""
+    """Extract forward prices from binned futures (uses mid_price from depth=0)."""
     if futures_df.empty:
         return pd.DataFrame(columns=['timestamp', 'expiry', 'forward_price'])
     
-    # Parse expiries and use mid_price as forward price
     futures_df['expiry'] = futures_df['symbol'].apply(lambda x: parse_future_name(x)[1])
     
     return pd.DataFrame({
@@ -33,14 +33,13 @@ def _process_futures(futures_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_option_iv(options_df: pd.DataFrame, forward_prices: pd.DataFrame, 
-                       risk_free_rate: float = 0.0, verbose: bool = False, 
-                       diagnostics: bool = False) -> pd.DataFrame:
-    """Compute implied volatility for binned options using forward prices.
-    Assumes orderbook is already binned and mid_price is calculated."""
+                       price_column: str, risk_free_rate: float = 0.0, 
+                       verbose: bool = False, diagnostics: bool = False) -> pd.DataFrame:
+    """Compute IV for options using specified price column ('mid_price', 'bid_1_px', or 'ask_1_px')."""
     if options_df.empty or forward_prices.empty:
         return pd.DataFrame()
     
-    # Parse option instruments (mid_price already calculated in trim_orderbook)
+    # Parse option instruments
     options_df[['inst_family', 'expiry', 'strike', 'option_type']] = pd.DataFrame(
         options_df['symbol'].apply(parse_option_name).tolist(), index=options_df.index
     )
@@ -63,18 +62,18 @@ def _compute_option_iv(options_df: pd.DataFrame, forward_prices: pd.DataFrame,
     valid = (df['tenor_days'] > 0) & (df['strike'] > 0) & (df['forward_price'] > 0)
     df = df[valid].copy()
     
-    # Convert option price from BTC to USD by multiplying by forward price
-    df['market_price_usd'] = df['mid_price'] * df['forward_price']
+    # Convert option price from BTC to USD
+    df['market_price_usd'] = df[price_column] * df['forward_price']
     
-    # Vectorized IV calculation
+    # Compute IV
     df['implied_vol'] = black76_implied_volatility_vectorized(
         market_price=df['market_price_usd'].values,
         F=df['forward_price'].values,
         K=df['strike'].values,
-        T=(df['tenor_days'] / 365.25).values,  # Convert days to years for Black-76
+        T=(df['tenor_days'] / 365.25).values,
         r=risk_free_rate,
         option_type=df['option_type'].values,
-        verbose=diagnostics  # Pass diagnostics flag to solver
+        verbose=diagnostics
     )
     
     # Report failed IV calculations
@@ -86,7 +85,7 @@ def _compute_option_iv(options_df: pd.DataFrame, forward_prices: pd.DataFrame,
     
     return df[[
         'timestamp', 'symbol', 'expiry', 'strike', 'option_type',
-        'mid_price', 'forward_price', 'tenor_days', 'log_moneyness', 'implied_vol'
+        price_column, 'forward_price', 'tenor_days', 'log_moneyness', 'implied_vol'
     ]]
 
 
@@ -97,10 +96,10 @@ def construct_iv_surface(
     time_step_minutes: int = 5,
     risk_free_rate: float = 0.0,
     verbose: bool = True,
-    diagnostics: bool = False
+    diagnostics: bool = False,
+    use_bid_ask: bool = False
 ) -> pd.DataFrame:
-    """Construct IV surface by fetching futures and options day-by-day.
-    Returns DataFrame with timestamp, expiry, strike, option_type, implied_vol, etc."""
+    """Construct IV surface day-by-day. If use_bid_ask=True, returns bid_iv/ask_iv columns."""
     all_iv_data = []
     
     # Create list of dates to fetch
@@ -109,7 +108,7 @@ def construct_iv_surface(
     for date in tqdm(dates_to_fetch, desc="Processing dates", disable=not verbose):
         day_end = date + timedelta(days=1) - timedelta(seconds=1)
         
-        # Step 1: Fetch futures orderbook (depth=0 to get mid_price only)
+        # Step 1: Fetch futures orderbook (always depth=0 for mid price)
         futures_df = fetch_market_data(
             '6', 'FUTURES', inst_family, date, day_end, 'daily', 
             verbose=verbose,
@@ -123,7 +122,7 @@ def construct_iv_surface(
         if verbose:
             print(f"  {date.date()}: {len(available_expiries)} available expiries")
         
-        # Step 3: Fetch options, filtering for expiries with futures
+        # Step 3: Fetch options with depth=1 for bid/ask if needed, else depth=0
         def filter_by_expiry(filename: str) -> bool:
             """Filter options by expiries that have corresponding futures."""
             try:
@@ -135,7 +134,7 @@ def construct_iv_surface(
         options_df = fetch_market_data(
             '6', 'OPTION', inst_family, date, day_end, 'daily', 
             verbose=verbose,
-            depth=0,
+            depth=1 if use_bid_ask else 0,
             include_criterion=filter_by_expiry,
             process_fn=lambda df: bin_orderbook(df, f'{time_step_minutes}min')
         )
@@ -146,12 +145,20 @@ def construct_iv_surface(
             continue
         
         # Step 4: Compute IVs
-        iv_data = _compute_option_iv(options_df, forward_prices, risk_free_rate, verbose, diagnostics)
+        if use_bid_ask:
+            # Compute bid and ask IVs separately and merge
+            bid_data = _compute_option_iv(options_df, forward_prices, 'bid_1_px', risk_free_rate, verbose, diagnostics).rename(columns={'implied_vol': 'bid_iv'})
+            ask_data = _compute_option_iv(options_df, forward_prices, 'ask_1_px', risk_free_rate, verbose, diagnostics).rename(columns={'implied_vol': 'ask_iv'})
+            
+            merge_cols = ['timestamp', 'symbol', 'expiry', 'strike', 'option_type', 
+                         'forward_price', 'tenor_days', 'log_moneyness']
+            iv_data = bid_data.merge(ask_data[merge_cols + ['ask_1_px', 'ask_iv']], on=merge_cols, how='outer')
+        else:
+            iv_data = _compute_option_iv(options_df, forward_prices, 'mid_price', risk_free_rate, verbose, diagnostics)
         
-        if not iv_data.empty:
-            all_iv_data.append(iv_data)
-            if verbose:
-                print(f"  {date.date()}: Computed {len(iv_data)} IVs")
+        all_iv_data.append(iv_data)
+        if verbose:
+            print(f"  {date.date()}: Computed {len(iv_data)} IVs")
     
     if not all_iv_data:
         if verbose:
@@ -170,132 +177,111 @@ def construct_iv_surface(
 def create_iv_surface_plot(
     iv_df: pd.DataFrame,
     grid_resolution: int = 40,
-    title: str = "Implied Volatility Surface"
+    title: str = "Implied Volatility Surface",
+    smoothing: float = 0.0,
+    kernel: str = 'thin_plate_spline'
 ) -> go.Figure:
-    """Create interactive 3D IV surface plot with time slider.
-    Data should already be time-binned from construct_iv_surface."""
-    if iv_df.empty:
-        print("No data to plot")
-        return go.Figure()
+    """Create 3D IV surface with time slider using RBF interpolation.
     
-    # Convert timestamps and filter valid IVs
+    Args:
+        smoothing: Smoothing parameter for RBF (0=interpolation, >0=regularization)
+        kernel: RBF kernel - 'thin_plate_spline' (default, smooth), 'cubic', 'quintic', 'multiquadric', 'linear'
+    """
+    
+    # Detect mode and prep data
+    has_bid_ask = 'bid_iv' in iv_df.columns and 'ask_iv' in iv_df.columns
     iv_df = iv_df.copy()
     iv_df['datetime'] = pd.to_datetime(iv_df['timestamp'], unit='ms')
-    iv_df = iv_df[np.isfinite(iv_df['implied_vol']) & (iv_df['implied_vol'] > 0)]
     
-    if len(iv_df) == 0:
-        print("No valid IV data to plot")
-        return go.Figure()
-    
-    # Get unique timestamps (data is already binned by construct_iv_surface)
-    unique_times = sorted(iv_df['datetime'].unique())
-    
-    # Compute fixed axis ranges across all data (prevents jumpy axes)
+    # Compute axis ranges once
     x_min, x_max = iv_df['log_moneyness'].quantile([0.01, 0.99])
     y_min, y_max = iv_df['tenor_days'].quantile([0.01, 0.99])
-    z_min, z_max = iv_df['implied_vol'].quantile([0.01, 0.99])
     
-    # Add padding to ranges
-    x_range = x_max - x_min
-    z_range = z_max - z_min
+    if has_bid_ask:
+        all_ivs = pd.concat([iv_df['bid_iv'].dropna(), iv_df['ask_iv'].dropna()])
+        z_min, z_max = all_ivs.quantile([0.01, 0.99])
+    else:
+        z_min, z_max = iv_df['implied_vol'].quantile([0.01, 0.99])
     
-    x_min -= x_range * 0.05
-    x_max += x_range * 0.05
-    # For log scale, use multiplicative padding
-    y_min = max(0.1, y_min * 0.9)  # Ensure positive for log scale
-    y_max = y_max * 1.1
-    z_min = max(0, z_min - z_range * 0.05)
-    z_max += z_range * 0.05
+    # Add padding
+    x_min, x_max = x_min - (x_max - x_min) * 0.05, x_max + (x_max - x_min) * 0.05
+    y_min, y_max = max(0.1, y_min * 0.9), y_max * 1.1
+    z_min, z_max = max(0, z_min - (z_max - z_min) * 0.05), z_max + (z_max - z_min) * 0.05
     
-    # Create frames for each unique timestamp
+    # Sequential frame generation
+    unique_times = sorted(iv_df['datetime'].unique())
     frames = []
-    for time_val in tqdm(unique_times, desc="Creating frames"):
+    
+    surfaces_created = 0
+    for time_val in tqdm(unique_times, desc="Processing frames"):
         bin_data = iv_df[iv_df['datetime'] == time_val]
+        frame_objects = []
         
-        if len(bin_data) < 3:
-            frames.append(go.Frame(
-                data=[
-                    go.Surface(x=[], y=[], z=[], showscale=False, name='IV Surface'),
-                    go.Scatter3d(x=[], y=[], z=[], mode='markers', name='Data Points')
-                ],
-                name=str(time_val),
-                layout=dict(
-                    scene_yaxis_tickvals=[],
-                    scene_yaxis_ticktext=[]
-                )
-            ))
-            continue
+        # Surface configs: (surf_type, iv_col, colorscale, showscale, scatter_color)
+        if has_bid_ask:
+            configs = [
+                ('bid', 'bid_iv', 'Blues', False, 'blue'),
+                ('ask', 'ask_iv', 'Reds', True, 'red')
+            ]
+        else:
+            configs = [('mid', 'implied_vol', 'Viridis', True, 'green')]
         
-        # Interpolate onto grid
-        log_m_grid, tenor_grid, iv_grid = _interpolate_surface(bin_data, grid_resolution)
-        
-        if log_m_grid is None:
-            frames.append(go.Frame(
-                data=[
-                    go.Surface(x=[], y=[], z=[], showscale=False, name='IV Surface'),
-                    go.Scatter3d(x=[], y=[], z=[], mode='markers', name='Data Points')
-                ],
-                name=str(time_val),
-                layout=dict(
-                    scene_yaxis_tickvals=[],
-                    scene_yaxis_ticktext=[]
-                )
-            ))
-            continue
-        
-        # Create surface
-        surface = go.Surface(
-            x=log_m_grid,
-            y=tenor_grid,  # Already in days
-            z=iv_grid,
-            colorscale='Viridis',
-            cmin=z_min,
-            cmax=z_max,
-            colorbar=dict(title="IV", x=1.02),
-            showscale=True,
-            name='IV Surface'
-        )
-        
-        # Create scatter points for actual data
-        scatter = go.Scatter3d(
-            x=bin_data['log_moneyness'],
-            y=bin_data['tenor_days'],
-            z=bin_data['implied_vol'],
-            mode='markers',
-            marker=dict(
-                size=3,
-                color='red',
-                symbol='circle'
-            ),
-            name='Data Points'
-        )
-        
-        # Get unique tenors for this frame only
-        frame_tenors = sorted(bin_data['tenor_days'].unique())
-        frame_tenor_labels = [f"{t:.2f}" for t in frame_tenors]
-        
-        frames.append(go.Frame(
-            data=[surface, scatter], 
-            name=str(time_val),
-            layout=dict(
-                scene_yaxis_tickvals=frame_tenors,
-                scene_yaxis_ticktext=frame_tenor_labels
+        for surf_type, iv_col, colorscale, showscale, scatter_color in configs:
+            # Get data with valid IVs
+            data = bin_data[bin_data[iv_col].notna()].copy()
+            if len(data) < 4:  # Need at least 4 points for RBF
+                continue
+            
+            # Fit RBF surface (debug first frame only)
+            debug = (surfaces_created == 0)
+            log_m_grid, tenor_grid, iv_grid = _fit_rbf_surface(
+                data, iv_col, grid_resolution, smoothing, kernel, debug
             )
-        ))
+            
+            if debug and log_m_grid is not None:
+                print(f"  Output IV surface: range=[{np.min(iv_grid):.4f}, {np.max(iv_grid):.4f}]")
+            
+            if log_m_grid is not None:
+                surfaces_created += 1
+                
+                # Create surface and scatter
+                surface = go.Surface(
+                    x=log_m_grid, y=tenor_grid, z=iv_grid,
+                    colorscale=colorscale, cmin=z_min, cmax=z_max,
+                    colorbar=dict(title="IV", x=1.02) if showscale else None,
+                    showscale=showscale, name=f'{surf_type.title()} IV', opacity=0.8
+                )
+                scatter = go.Scatter3d(
+                    x=data['log_moneyness'], y=data['tenor_days'], z=data[iv_col],
+                    mode='markers', marker=dict(size=2, color=scatter_color),
+                    name=f'{surf_type.title()} Points'
+                )
+                frame_objects.extend([surface, scatter])
+        
+        if frame_objects:
+            frame_tenors = sorted(bin_data['tenor_days'].unique())
+            frames.append(go.Frame(
+                data=frame_objects, name=str(time_val),
+                layout=dict(scene_yaxis_tickvals=frame_tenors,
+                           scene_yaxis_ticktext=[f"{t:.2f}" for t in frame_tenors])
+            ))
     
-    # Create figure with initial frame data and layout
-    initial_layout = frames[0].layout if frames and hasattr(frames[0], 'layout') else None
-    fig = go.Figure(data=frames[0].data if frames else [], frames=frames)
+    if not frames:
+        print("No valid frames generated")
+        return None
     
-    # Get initial tenor ticks from first frame
-    initial_tenors = []
-    initial_tenor_labels = []
-    if frames and len(frames[0].data) > 0:
-        first_bin_data = iv_df[iv_df['datetime'] == unique_times[0]]
-        if not first_bin_data.empty:
-            initial_tenors = sorted(first_bin_data['tenor_days'].unique())
-            initial_tenor_labels = [f"{t:.2f}" for t in initial_tenors]
+    print(f"\n✓ Generated {len(frames)} frames with {surfaces_created} total surfaces")
+    print(f"First frame has {len(frames[0].data)} traces:")
+    for trace in frames[0].data:
+        print(f"  - {trace.name}: {type(trace).__name__}")
+        if hasattr(trace, 'z') and trace.z is not None:
+            z_data = trace.z if isinstance(trace.z, np.ndarray) else np.array(trace.z)
+            if len(z_data.shape) == 2:
+                print(f"    Shape: {z_data.shape}, Range: [{np.min(z_data):.4f}, {np.max(z_data):.4f}]")
     
+    # Build figure
+    first_tenors = sorted(iv_df[iv_df['datetime'] == unique_times[0]]['tenor_days'].unique())
+    fig = go.Figure(data=frames[0].data, frames=frames)
     fig.update_layout(
         title=title,
         scene=dict(
@@ -303,99 +289,108 @@ def create_iv_surface_plot(
             yaxis_title='Tenor (days)',
             zaxis_title='Implied Volatility',
             xaxis=dict(range=[x_min, x_max]),
-            yaxis=dict(
-                type='log',  # Logarithmic scale
-                range=[np.log10(y_min), np.log10(y_max)],
-                tickmode='array',
-                tickvals=initial_tenors,
-                ticktext=initial_tenor_labels
-            ),
+            yaxis=dict(type='log', range=[np.log10(y_min), np.log10(y_max)], tickmode='array',
+                      tickvals=first_tenors, ticktext=[f"{t:.2f}" for t in first_tenors]),
             zaxis=dict(range=[z_min, z_max]),
+            aspectmode='cube',
             camera=dict(eye=dict(x=1.5, y=1.5, z=1.3))
         ),
         updatemenus=[{
-            'type': 'buttons',
-            'showactive': False,
+            'type': 'buttons', 'showactive': False,
             'buttons': [
                 {'label': 'Play', 'method': 'animate',
-                 'args': [None, {'frame': {'duration': 500, 'redraw': True},
-                                 'fromcurrent': True, 'transition': {'duration': 300}}]},
+                 'args': [None, {'frame': {'duration': 500, 'redraw': True}, 'fromcurrent': True}]},
                 {'label': 'Pause', 'method': 'animate',
-                 'args': [[None], {'frame': {'duration': 0, 'redraw': False},
-                                   'mode': 'immediate', 'transition': {'duration': 0}}]}
-            ],
-            'x': 0.1, 'y': 0
+                 'args': [[None], {'frame': {'duration': 0, 'redraw': False}, 'mode': 'immediate'}]}
+            ], 'x': 0.1, 'y': 0
         }],
         sliders=[{
-            'active': 0,
-            'yanchor': 'top', 'y': 0,
-            'xanchor': 'left', 'x': 0.3,
+            'active': 0, 'yanchor': 'top', 'y': 0, 'xanchor': 'left', 'x': 0.3,
             'currentvalue': {'prefix': 'Time: ', 'visible': True, 'xanchor': 'right'},
-            'steps': [
-                {'args': [[frame.name], {'frame': {'duration': 300, 'redraw': True},
-                                         'mode': 'immediate', 'transition': {'duration': 300}}],
-                 'method': 'animate', 'label': str(frame.name)[:16]}
-                for frame in frames
-            ]
+            'steps': [{'args': [[f.name], {'frame': {'duration': 300, 'redraw': True}, 'mode': 'immediate'}],
+                      'method': 'animate', 'label': str(f.name)[:16]} for f in frames]
         }],
-        height=700,
-        width=1000
+        height=700, width=1000
     )
-    
     return fig
 
 
-def _interpolate_surface(df: pd.DataFrame, grid_resolution: int = 40):
-    """Interpolate sparse IV data onto regular grid.
-    Returns log_moneyness_grid, tenor_grid, iv_grid as 2D arrays."""
-    if len(df) < 3:
-        return None, None, None
+def _fit_rbf_surface(df: pd.DataFrame, iv_col: str, grid_resolution: int = 40, 
+                     smoothing: float = 0.0, kernel: str = 'thin_plate_spline', debug: bool = False):
+    """Fit RBF interpolator to IV data and construct smooth surface. Returns (grid_x, grid_y, grid_z)."""
     
-    # Remove NaN/inf values
+    # Clean data
     df_clean = df[
         np.isfinite(df['log_moneyness']) & 
         np.isfinite(df['tenor_days']) & 
-        np.isfinite(df['implied_vol']) &
-        (df['tenor_days'] > 0)
+        np.isfinite(df[iv_col]) &
+        (df['tenor_days'] > 0) &
+        (df[iv_col] > 0)
     ].copy()
     
-    if len(df_clean) < 3:
+    if debug and len(df_clean) > 0:
+        print(f"\nDEBUG _fit_rbf_surface:")
+        print(f"  Input IVs: count={len(df_clean)}, range=[{df_clean[iv_col].min():.4f}, {df_clean[iv_col].max():.4f}]")
+        print(f"  Log moneyness range: [{df_clean['log_moneyness'].min():.4f}, {df_clean['log_moneyness'].max():.4f}]")
+        print(f"  Tenor range: [{df_clean['tenor_days'].min():.2f}, {df_clean['tenor_days'].max():.2f}] days")
+        print(f"  Kernel: {kernel}, Smoothing: {smoothing}")
+    
+    if len(df_clean) < 4:
         return None, None, None
     
-    # Create grid with padding
+    # Prepare input points (log_moneyness, log(tenor_days)) and values
+    # Use log(tenor) for better RBF behavior across wide tenor ranges
+    X = np.column_stack([
+        df_clean['log_moneyness'].values,
+        np.log(df_clean['tenor_days'].values)
+    ])
+    y = df_clean[iv_col].values
+    
+    # Create 2D grid for evaluation
     log_m_min, log_m_max = df_clean['log_moneyness'].quantile([0.05, 0.95])
-    tenor_min, tenor_max = df_clean['tenor_days'].quantile([0.05, 0.95])
-    
     log_m_range = log_m_max - log_m_min
-    tenor_range = tenor_max - tenor_min
-    
     log_m_min -= log_m_range * 0.1
     log_m_max += log_m_range * 0.1
-    tenor_min = max(1e-6, tenor_min - tenor_range * 0.1)
-    tenor_max += tenor_range * 0.1
-    
     log_m_grid = np.linspace(log_m_min, log_m_max, grid_resolution)
-    tenor_grid = np.linspace(tenor_min, tenor_max, grid_resolution)
-    log_m_mesh, tenor_mesh = np.meshgrid(log_m_grid, tenor_grid)
     
-    # Interpolate
-    points = df_clean[['log_moneyness', 'tenor_days']].values
-    values = df_clean['implied_vol'].values
+    # For tenor, use log-spaced grid in original tenor space
+    tenor_min, tenor_max = df_clean['tenor_days'].quantile([0.05, 0.95])
+    tenor_min = max(0.1, tenor_min * 0.9)
+    tenor_max = tenor_max * 1.1
+    tenor_grid_1d = np.logspace(np.log10(tenor_min), np.log10(tenor_max), grid_resolution)
+    
+    # Create meshgrid
+    log_m_mesh, tenor_mesh = np.meshgrid(log_m_grid, tenor_grid_1d)
+    
+    # Prepare evaluation points (using log(tenor))
+    X_eval = np.column_stack([
+        log_m_mesh.ravel(),
+        np.log(tenor_mesh.ravel())
+    ])
     
     try:
-        iv_grid = griddata(
-            points, values,
-            (log_m_mesh, tenor_mesh),
-            method='cubic',
-            fill_value=np.nan
-        )
-    except:
-        # Fall back to linear if cubic fails
-        iv_grid = griddata(
-            points, values,
-            (log_m_mesh, tenor_mesh),
-            method='linear',
-            fill_value=np.nan
-        )
-    
-    return log_m_mesh, tenor_mesh, iv_grid
+        # Fit RBF interpolator
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=RuntimeWarning)
+            rbf = RBFInterpolator(X, y, kernel=kernel, smoothing=smoothing)
+            
+            # Evaluate on grid
+            iv_grid_flat = rbf(X_eval)
+            iv_grid = iv_grid_flat.reshape(log_m_mesh.shape)
+            
+            # Clamp values to reasonable range (avoid extrapolation artifacts)
+            iv_min, iv_max = np.percentile(y, [1, 99])
+            iv_buffer = (iv_max - iv_min) * 0.3
+            iv_grid = np.clip(iv_grid, max(0, iv_min - iv_buffer), iv_max + iv_buffer)
+            
+            if debug:
+                print(f"  RBF fitted successfully")
+                print(f"  Evaluation grid: {grid_resolution}x{grid_resolution} = {grid_resolution**2} points")
+                print(f"  Output IV range (clamped): [{np.min(iv_grid):.4f}, {np.max(iv_grid):.4f}]")
+            
+            return log_m_mesh, tenor_mesh, iv_grid
+            
+    except Exception as e:
+        if debug:
+            print(f"  RBF fitting failed: {e}")
+        return None, None, None

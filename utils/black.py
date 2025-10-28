@@ -4,7 +4,7 @@ from scipy.optimize import brentq
 
 # Black-76 Model Functions (Vectorized)
 def black76_call_price(F, K, T, r, sigma):
-    """Calculate Black-76 call option price."""
+    """Black-76 call price."""
     if T <= 0 or sigma <= 0:
         return max(F - K, 0)
     
@@ -14,7 +14,7 @@ def black76_call_price(F, K, T, r, sigma):
     return np.exp(-r * T) * (F * norm.cdf(d1) - K * norm.cdf(d2))
 
 def black76_put_price(F, K, T, r, sigma):
-    """Calculate Black-76 put option price."""
+    """Black-76 put price."""
     if T <= 0 or sigma <= 0:
         return max(K - F, 0)
     
@@ -24,17 +24,7 @@ def black76_put_price(F, K, T, r, sigma):
     return np.exp(-r * T) * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
 
 def black76_implied_volatility(market_price, F, K, T, r, option_type='C', max_iter=100):
-    """
-    Calculate implied volatility using Black-76 model.
-    
-    Parameters:
-    - market_price: Observed market price
-    - F: Forward price
-    - K: Strike price
-    - T: Time to expiry (in years)
-    - r: Risk-free rate (use 0 for crypto)
-    - option_type: 'C' for call, 'P' for put
-    """
+    """Black-76 IV using Brent's method. Returns NaN if fails."""
     if T <= 0:
         return np.nan
     
@@ -58,12 +48,7 @@ def black76_implied_volatility(market_price, F, K, T, r, option_type='C', max_it
 
 
 def black76_vega(F, K, T, r, sigma):
-    """
-    Calculate vega (derivative of price w.r.t. volatility) for Black-76 model.
-    Vega is the same for calls and puts.
-    
-    Parameters are vectorized numpy arrays or scalars.
-    """
+    """Black-76 vega (∂price/∂σ). Vectorized for arrays or scalars."""
     # Handle edge cases
     mask = (T > 0) & (sigma > 0) & (F > 0) & (K > 0)
     
@@ -77,15 +62,7 @@ def black76_vega(F, K, T, r, sigma):
 
 
 def black76_price_vectorized(F, K, T, r, sigma, option_type):
-    """
-    Vectorized Black-76 pricing for calls and puts.
-    
-    Parameters:
-    - F, K, T, r, sigma: numpy arrays or scalars
-    - option_type: numpy array of 'C' or 'P' strings
-    
-    Returns: numpy array of prices
-    """
+    """Vectorized Black-76 pricing for calls/puts. Returns array of prices."""
     F = np.asarray(F, dtype=float)
     K = np.asarray(K, dtype=float)
     T = np.asarray(T, dtype=float)
@@ -131,25 +108,9 @@ def black76_price_vectorized(F, K, T, r, sigma, option_type):
 
 def black76_implied_volatility_vectorized(
     market_price, F, K, T, r, option_type,
-    max_iter=100, tol=1e-6, initial_guess=0.3, verbose=False
+    max_iter=100, tol=1e-4, initial_guess=0.3, verbose=False
 ):
-    """
-    Vectorized Newton-Raphson method for Black-76 implied volatility.
-    
-    Parameters:
-    - market_price: numpy array of observed market prices
-    - F: numpy array of forward prices
-    - K: numpy array of strike prices
-    - T: numpy array of time to expiry (in years)
-    - r: risk-free rate (scalar or array)
-    - option_type: numpy array of 'C' or 'P'
-    - max_iter: maximum iterations for Newton-Raphson
-    - tol: convergence tolerance
-    - initial_guess: starting volatility guess
-    - verbose: if True, print detailed diagnostic information
-    
-    Returns: numpy array of implied volatilities (NaN for failures)
-    """
+    """Vectorized Newton-Raphson IV solver. Uses relative tolerance (default 0.01%)."""
     # Convert to numpy arrays
     market_price = np.asarray(market_price, dtype=float)
     F = np.asarray(F, dtype=float)
@@ -214,8 +175,9 @@ def black76_implied_volatility_vectorized(
         # Compute price difference
         price_diff = model_price - market_price[active]
         
-        # Check convergence
-        converged = np.abs(price_diff) < tol
+        # Check convergence using relative tolerance
+        relative_error = np.abs(price_diff) / np.maximum(market_price[active], 1e-10)
+        converged = relative_error < tol
         
         # Track diagnostics
         if verbose:
@@ -265,11 +227,11 @@ def black76_implied_volatility_vectorized(
             F[still_active], K[still_active], T[still_active], r, 
             sigma[still_active], option_type[still_active]
         )
-        relative_error = np.abs(final_price - market_price[still_active]) / market_price[still_active]
+        relative_error = np.abs(final_price - market_price[still_active]) / np.maximum(market_price[still_active], 1e-10)
         
-        # Much stricter criteria: must be within 1% error AND moved significantly from initial guess
+        # Accept near-convergence: within 5x tolerance AND moved significantly from initial guess
         moved_from_initial = np.abs(sigma[still_active] - sigma_initial[still_active]) > 0.02
-        close_enough = (relative_error < 0.01) & moved_from_initial
+        close_enough = (relative_error < tol * 5) & moved_from_initial
         
         if np.any(close_enough):
             still_active_indices = np.where(still_active)[0]

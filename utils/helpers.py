@@ -7,13 +7,13 @@ def bin_orderbook(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     Returns filtered df with 'time_bin' and 'timestamp' (binned) columns added.
     freq: pandas frequency string (e.g., '5min', '1min', '30s', '100ms')"""
     # Compute time bins without adding to df (more efficient on large dataframes)
-    time_bins = pd.to_datetime(df['timeMs'], unit='ms').dt.floor(freq)
+    time_bins = pd.to_datetime(df['timeMs'], unit='ms').dt.ceil(freq)
     
     # Group and find most recent entries (only creates temporary groupby object)
     df = df.loc[df.groupby([time_bins, 'symbol'])['timeMs'].idxmax()]
     
     # Now add columns only to filtered df
-    df['time_bin'] = pd.to_datetime(df['timeMs'], unit='ms').dt.floor(freq)
+    df['time_bin'] = pd.to_datetime(df['timeMs'], unit='ms').dt.ceil(freq)
     df['timestamp'] = df['time_bin'].astype(np.int64) // 10**6
     
     return df

@@ -2,6 +2,7 @@ from .api import fetch_market_data
 from .helpers import parse_option_name, parse_future_name, get_option_combos, trim_orderbook, bin_orderbook
 from .iv import construct_iv_surface, create_iv_surface_plot
 from .black import black76_implied_volatility, black76_call_price, black76_put_price
+from .forward import compute_segment_carry, interpolate_forward, compute_continuous_forward_curve, build_forward_surface
 
 __all__ = [
     'fetch_market_data',
@@ -14,5 +15,9 @@ __all__ = [
     'create_iv_surface_plot',
     'black76_implied_volatility',
     'black76_call_price',
-    'black76_put_price'
+    'black76_put_price',
+    'compute_segment_carry',
+    'interpolate_forward',
+    'compute_continuous_forward_curve',
+    'build_forward_surface'
 ]

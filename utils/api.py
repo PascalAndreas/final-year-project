@@ -98,16 +98,17 @@ def fetch_market_data(
         # Parse response and download CSVs
         download_info = []
         
+        # Check if details list is empty (no data available for date range)
+        if not data['data'][0]['details']:
+            if verbose:
+                print(f"Fetch #{i+1}/{len(ranges)}: No files available for this date range")
+            continue
+        
         # Process group details
         for group in data['data'][0]['details'][0]['groupDetails']:
             # Apply include_criterion filter if provided
             if include_criterion is not None:
                 if not include_criterion(group['filename']):
-                    continue
-            # Default behavior for futures - filter by filename prefix
-            elif inst_type == 'FUTURES':
-                # Only include files that start with the specified instrument family
-                if not group['filename'].startswith(f"{inst_family_list}-"):
                     continue
             
             download_info.append({

@@ -120,3 +120,14 @@ def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
         (col.split('_')[1].isdigit() and int(col.split('_')[1]) <= n_levels)
     ]
     return df[cols_to_keep]
+
+def candle_to_bounds(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert candlestick OHLC data to bid/ask bounds format for forward pricing."""
+    df = df.copy()
+    df['bid_1_px'] = df['low']
+    df['ask_1_px'] = df['high']
+    df['time_bin'] = pd.to_datetime(df['open_time'], unit='ms')
+    df['timestamp'] = df['open_time']
+    if 'instrument_name' in df.columns:
+        df['symbol'] = df['instrument_name']
+    return df

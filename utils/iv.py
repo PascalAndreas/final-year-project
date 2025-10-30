@@ -17,76 +17,81 @@ import time
 from .api import fetch_market_data
 from .black import black76_implied_volatility, black76_implied_volatility_vectorized
 from .helpers import parse_option_name, parse_future_name, bin_orderbook
+from .forward import compute_segment_carry, interpolate_forward
 
-def _process_futures(futures_df: pd.DataFrame) -> pd.DataFrame:
-    """Extract forward prices from binned futures (uses mid_price from depth=0)."""
-    if futures_df.empty:
-        return pd.DataFrame(columns=['timestamp', 'expiry', 'forward_price'])
+def _build_forward_interpolator(swap_df: pd.DataFrame, futures_df: pd.DataFrame):
+    """Build forward interpolator for all timestamps. Returns dict: timestamp -> segments_df."""
+    if swap_df.empty or futures_df.empty:
+        return {}
     
     futures_df['expiry'] = futures_df['symbol'].apply(lambda x: parse_future_name(x)[1])
+    interpolators = {}
     
-    return pd.DataFrame({
-        'timestamp': futures_df['timestamp'],
-        'expiry': futures_df['expiry'],
-        'forward_price': futures_df['mid_price']
-    })
+    for _, swap_row in swap_df.iterrows():
+        time_bin = swap_row['time_bin']
+        swap_bid, swap_ask = swap_row['bid_1_px'], swap_row['ask_1_px']
+        futures_at_time = futures_df[futures_df['time_bin'] == time_bin].copy()
+        
+        if len(futures_at_time) > 0:
+            segments = compute_segment_carry(futures_at_time, swap_bid, swap_ask, time_bin)
+            interpolators[swap_row['timestamp']] = (segments, swap_bid, swap_ask, time_bin)
+    
+    return interpolators
 
 
-def _compute_option_iv(options_df: pd.DataFrame, forward_prices: pd.DataFrame, 
-                       price_column: str, risk_free_rate: float = 0.0, 
-                       verbose: bool = False, diagnostics: bool = False) -> pd.DataFrame:
-    """Compute IV for options using specified price column ('mid_price', 'bid_1_px', or 'ask_1_px')."""
-    if options_df.empty or forward_prices.empty:
+def _compute_option_iv(options_df: pd.DataFrame, interpolators: dict, 
+                       price_column: str, forward_bound: str,
+                       risk_free_rate: float = 0.0, verbose: bool = False, 
+                       diagnostics: bool = False) -> pd.DataFrame:
+    """Compute IV using interpolated forwards. forward_bound: 'lower' for bid, 'upper' for ask."""
+    if options_df.empty or not interpolators:
         return pd.DataFrame()
     
-    # Parse option instruments
     options_df[['inst_family', 'expiry', 'strike', 'option_type']] = pd.DataFrame(
         options_df['symbol'].apply(parse_option_name).tolist(), index=options_df.index
     )
     
-    # Merge with forward prices
-    df = options_df.merge(
-        forward_prices, 
-        on=['timestamp', 'expiry'],
-        how='inner'
-    )
+    forward_data = []
+    for _, opt in options_df.iterrows():
+        if opt['timestamp'] not in interpolators:
+            continue
+        segments, swap_bid, swap_ask, swap_time = interpolators[opt['timestamp']]
+        T = (opt['expiry'] - swap_time).total_seconds() / (365.25 * 24 * 3600)
+        
+        F_bounds = interpolate_forward(T, segments)
+        if F_bounds is None:
+            continue
+        
+        forward_price = F_bounds[0] if forward_bound == 'lower' else F_bounds[1]
+        forward_data.append({'timestamp': opt['timestamp'], 'expiry': opt['expiry'], 
+                           'strike': opt['strike'], 'option_type': opt['option_type'],
+                           'symbol': opt['symbol'], price_column: opt[price_column],
+                           'forward_price': forward_price})
     
-    # Vectorized calculations
-    df['tenor_days'] = (
-        (df['expiry'] - pd.to_datetime(df['timestamp'], unit='ms')).dt.total_seconds() 
-        / (24 * 3600)
-    )
+    if not forward_data:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(forward_data)
+    df['tenor_days'] = ((df['expiry'] - pd.to_datetime(df['timestamp'], unit='ms')).dt.total_seconds() / (24 * 3600))
     df['log_moneyness'] = np.log(df['strike'] / df['forward_price'])
     
-    # Filter invalid entries
     valid = (df['tenor_days'] > 0) & (df['strike'] > 0) & (df['forward_price'] > 0)
     df = df[valid].copy()
     
-    # Convert option price from BTC to USD
     df['market_price_usd'] = df[price_column] * df['forward_price']
-    
-    # Compute IV
     df['implied_vol'] = black76_implied_volatility_vectorized(
-        market_price=df['market_price_usd'].values,
-        F=df['forward_price'].values,
-        K=df['strike'].values,
-        T=(df['tenor_days'] / 365.25).values,
-        r=risk_free_rate,
-        option_type=df['option_type'].values,
-        verbose=diagnostics
+        market_price=df['market_price_usd'].values, F=df['forward_price'].values,
+        K=df['strike'].values, T=(df['tenor_days'] / 365.25).values,
+        r=risk_free_rate, option_type=df['option_type'].values, verbose=diagnostics
     )
     
-    # Report failed IV calculations
     failed_count = df['implied_vol'].isna().sum()
     if verbose and failed_count > 0:
         print(f"    Failed IV calculations: {failed_count}/{len(df)}")
     
     df = df.dropna(subset=['implied_vol'])
-    
-    return df[[
-        'timestamp', 'symbol', 'expiry', 'strike', 'option_type',
-        price_column, 'forward_price', 'tenor_days', 'log_moneyness', 'implied_vol'
-    ]]
+    return df[['timestamp', 'symbol', 'expiry', 'strike', 'option_type',
+               price_column, 'forward_price', 'tenor_days', 'log_moneyness', 'implied_vol']]
 
 
 def construct_iv_surface(
@@ -99,43 +104,43 @@ def construct_iv_surface(
     diagnostics: bool = False,
     use_bid_ask: bool = False
 ) -> pd.DataFrame:
-    """Construct IV surface day-by-day. If use_bid_ask=True, returns bid_iv/ask_iv columns."""
+    """Construct IV surface using interpolated forwards. Computes IV for ALL options, not just those with listed futures."""
     all_iv_data = []
-    
-    # Create list of dates to fetch
     dates_to_fetch = [start_date + timedelta(days=i) for i in range(num_days)]
     
     for date in tqdm(dates_to_fetch, desc="Processing dates", disable=not verbose):
         day_end = date + timedelta(days=1) - timedelta(seconds=1)
         
-        # Step 1: Fetch futures orderbook (always depth=0 for mid price)
-        futures_df = fetch_market_data(
-            '6', 'FUTURES', inst_family, date, day_end, 'daily', 
-            verbose=verbose,
-            depth=0,
+        # Fetch SWAP data for forward curve anchor
+        swap_df = fetch_market_data(
+            '6', 'SWAP', inst_family, date, day_end, 'daily',
+            verbose=verbose, depth=1,
+            include_criterion=lambda filename: filename.startswith(f'{inst_family}-SWAP'),
             process_fn=lambda df: bin_orderbook(df, f'{time_step_minutes}min')
         )
         
-        # Step 2: Process futures to get forward prices and available expiries
-        forward_prices = _process_futures(futures_df)
-        available_expiries = set(forward_prices['expiry'].unique())
+        # Fetch futures for forward curve construction
+        futures_df = fetch_market_data(
+            '6', 'FUTURES', inst_family, date, day_end, 'daily',
+            verbose=verbose, depth=1,
+            include_criterion=lambda filename: filename.startswith(f'{inst_family}-'),
+            process_fn=lambda df: bin_orderbook(df, f'{time_step_minutes}min')
+        )
+        
+        # Build forward interpolators
+        interpolators = _build_forward_interpolator(swap_df, futures_df)
+        if not interpolators:
+            if verbose:
+                print(f"  {date.date()}: No forward curve data, skipping")
+            continue
+        
         if verbose:
-            print(f"  {date.date()}: {len(available_expiries)} available expiries")
+            print(f"  {date.date()}: Built {len(interpolators)} forward curves")
         
-        # Step 3: Fetch options with depth=1 for bid/ask if needed, else depth=0
-        def filter_by_expiry(filename: str) -> bool:
-            """Filter options by expiries that have corresponding futures."""
-            try:
-                _, expiry, _, _ = parse_option_name(filename)
-                return expiry in available_expiries
-            except:
-                return False
-        
+        # Fetch ALL options (no expiry filter)
         options_df = fetch_market_data(
-            '6', 'OPTION', inst_family, date, day_end, 'daily', 
-            verbose=verbose,
-            depth=1 if use_bid_ask else 0,
-            include_criterion=filter_by_expiry,
+            '6', 'OPTION', inst_family, date, day_end, 'daily',
+            verbose=verbose, depth=1 if use_bid_ask else 0,
             process_fn=lambda df: bin_orderbook(df, f'{time_step_minutes}min')
         )
         
@@ -144,17 +149,20 @@ def construct_iv_surface(
                 print(f"  {date.date()}: No options data, skipping")
             continue
         
-        # Step 4: Compute IVs
+        # Compute IVs using interpolated forwards
         if use_bid_ask:
-            # Compute bid and ask IVs separately and merge
-            bid_data = _compute_option_iv(options_df, forward_prices, 'bid_1_px', risk_free_rate, verbose, diagnostics).rename(columns={'implied_vol': 'bid_iv'})
-            ask_data = _compute_option_iv(options_df, forward_prices, 'ask_1_px', risk_free_rate, verbose, diagnostics).rename(columns={'implied_vol': 'ask_iv'})
+            bid_data = _compute_option_iv(options_df, interpolators, 'bid_1_px', 'lower', 
+                                         risk_free_rate, verbose, diagnostics).rename(columns={'implied_vol': 'bid_iv'})
+            ask_data = _compute_option_iv(options_df, interpolators, 'ask_1_px', 'upper',
+                                         risk_free_rate, verbose, diagnostics).rename(columns={'implied_vol': 'ask_iv'})
             
-            merge_cols = ['timestamp', 'symbol', 'expiry', 'strike', 'option_type', 
+            merge_cols = ['timestamp', 'symbol', 'expiry', 'strike', 'option_type',
                          'forward_price', 'tenor_days', 'log_moneyness']
             iv_data = bid_data.merge(ask_data[merge_cols + ['ask_1_px', 'ask_iv']], on=merge_cols, how='outer')
         else:
-            iv_data = _compute_option_iv(options_df, forward_prices, 'mid_price', risk_free_rate, verbose, diagnostics)
+            # For mid, use average of bounds
+            iv_data = _compute_option_iv(options_df, interpolators, 'mid_price', 'lower',
+                                        risk_free_rate, verbose, diagnostics)
         
         all_iv_data.append(iv_data)
         if verbose:
@@ -165,9 +173,7 @@ def construct_iv_surface(
             print("No IV data computed")
         return pd.DataFrame()
     
-    # Combine all data
     result = pd.concat(all_iv_data, ignore_index=True)
-    
     if verbose:
         print(f"\n✓ Total: {len(result)} IV points across {len(dates_to_fetch)} days")
     

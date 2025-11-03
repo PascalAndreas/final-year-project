@@ -103,9 +103,14 @@ def _get_file_list(module: int | str, inst_type: str, inst_family_list: str,
     
     return download_info, total_size_mb
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    reraise=True
+)
 async def download_csv_async(url: str, output_path: Path, decompress: bool = True) -> None:
     """
-    Download CSV file asynchronously.
+    Download CSV file asynchronously with automatic retry on network errors.
     """
     
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
@@ -205,7 +210,7 @@ def fetch_orderbook_lazy(inst_family: str, inst_type: str, date_val, temp_base_d
     
     # Download all CSVs concurrently
     async def download_all():
-        semaphore = asyncio.Semaphore(8)
+        semaphore = asyncio.Semaphore(64)
         
         async def download_one(task):
             async with semaphore:
@@ -262,16 +267,39 @@ def fetch_orderbook_lazy(inst_family: str, inst_type: str, date_val, temp_base_d
             ignore_errors=True  # Handle OKX's malformed values (e.g. "115334.9.5")
         )
         
-        # Standardize FUTURES columns (lazy)
+        # Standardize FUTURES columns (lazy) - only rename columns that exist
         if inst_type == 'FUTURES':
-            lf = lf.rename(futures_rename)
+            # Get actual columns in the CSV
+            actual_cols = lf.collect_schema().names()
+            # Only apply renames for columns that exist (handles both old and new formats)
+            applicable_renames = {old: new for old, new in futures_rename.items() if old in actual_cols}
+            if applicable_renames:
+                lf = lf.rename(applicable_renames)
         
         # Always add symbol from filename (more reliable than reading from CSV)
         lf = lf.with_columns(pl.lit(symbol).alias('symbol'))
         
-        # Select only depth 5 columns (projection pushdown)
-        available_cols = [c for c in depth_5_cols if c in lf.collect_schema().names()]
-        lf = lf.select(available_cols)
+        # Ensure all depth 5 columns exist (fill missing with nulls for schema consistency)
+        # This is critical for OPTIONS where different instruments may have different depths
+        actual_cols = set(lf.collect_schema().names())
+        missing_cols = [c for c in depth_5_cols if c not in actual_cols]
+        
+        if missing_cols:
+            # Add missing columns as nulls with appropriate types
+            null_exprs = []
+            for col in missing_cols:
+                if 'Ms' in col:
+                    null_exprs.append(pl.lit(None, dtype=pl.Int64).alias(col))
+                elif 'ordCnt' in col or 'Cnt' in col:
+                    null_exprs.append(pl.lit(None, dtype=pl.Int64).alias(col))
+                elif col == 'symbol':
+                    null_exprs.append(pl.lit(None, dtype=pl.String).alias(col))
+                else:  # price/quantity columns
+                    null_exprs.append(pl.lit(None, dtype=pl.Float64).alias(col))
+            lf = lf.with_columns(null_exprs)
+        
+        # Select depth 5 columns in consistent order
+        lf = lf.select(depth_5_cols)
         
         # Stream to parquet part (never materialize full CSV in memory)
         part_path = temp_dir / f'part_{len(part_files)}.parquet'

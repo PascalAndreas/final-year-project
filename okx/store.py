@@ -314,6 +314,15 @@ class OrderbookStore:
         return self._get_cached('__derived__', '__derived__', start, end, cache_name,
                                lambda: recipe(self, start, end))
     
+    def delete_raw(self, inst_family: str, inst_type: str, date_obj: date):
+        """Delete raw orderbook file and manifest entry for given family/type/date."""
+        path = self._path_for(inst_family, inst_type, date_obj, 'raw')
+        if path.exists():
+            path.unlink()
+        with sqlite3.connect(self.manifest.path) as conn:
+            conn.execute("DELETE FROM files WHERE inst_family=? AND inst_type=? AND date=? AND variant='raw'",
+                        (inst_family, inst_type, date_obj.isoformat()))
+    
     def clear_cache(self, cache_name: Optional[str] = None):
         """
         Delete cached files and manifest entries.

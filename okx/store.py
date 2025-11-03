@@ -105,6 +105,9 @@ class OrderbookStore:
         """Generate parquet path for family/type/date/variant."""
         if variant == 'raw':
             return (self.root / 'orderbook' / inst_family / inst_type / f'{date_obj.isoformat()}.parquet')
+        elif inst_family == '__derived__' and inst_type == '__derived__':
+            # Derived data: cache/derived/{variant}/YYYY-MM-DD.parquet
+            return (self.root / 'cache' / 'derived' / variant / f'{date_obj.isoformat()}.parquet')
         else:
             return (self.root / 'cache' / variant / inst_family / inst_type / f'{date_obj.isoformat()}.parquet')
     
@@ -184,31 +187,22 @@ class OrderbookStore:
         
         return lf
     
-    def _write_cache(self, lf: pl.LazyFrame, inst_family: str, inst_type: str, 
-                     dates: list[date], cache_name: str):
-        """Write transformed LazyFrame to cache (one file per date)."""
-        # Collect to split by date
+    def _write_cache(self, lf: pl.LazyFrame, dates: list[date], cache_name: str,
+                     inst_family: str = '__derived__', inst_type: str = '__derived__'):
+        """Write LazyFrame to cache (one file per date)."""
         df = lf.collect()
-        
         if df.is_empty():
             return
         
-        # Add temporary date column from timeMs (always present)
-        df = df.with_columns(
-            pl.from_epoch('timeMs', time_unit='ms').cast(pl.Date).alias('_date')
-        )
+        # Add temporary date column from timeMs
+        df = df.with_columns(pl.from_epoch('timeMs', time_unit='ms').cast(pl.Date).alias('_date'))
         
-        # Write each date separately
         for date_val in dates:
             date_df = df.filter(pl.col('_date') == date_val)
-            
             if date_df.is_empty():
-                # Skip dates with no data (e.g., OKX missing data days)
                 continue
             
-            # Remove temporary date column before writing
             date_df = date_df.drop('_date')
-            
             path = self._path_for(inst_family, inst_type, date_val, cache_name)
             path.parent.mkdir(parents=True, exist_ok=True)
             
@@ -217,13 +211,38 @@ class OrderbookStore:
             date_df.write_parquet(str(tmp_path), compression='zstd', statistics=True)
             tmp_path.rename(path)
             
-            # Update manifest
-            row_count = len(date_df)
-            
             self.manifest.upsert(ManifestRow(
-                inst_family=inst_family, inst_type=inst_type, date=date_val.isoformat(), 
-                variant=cache_name, path=str(path), rows=row_count
+                inst_family=inst_family, inst_type=inst_type, date=date_val.isoformat(),
+                variant=cache_name, path=str(path), rows=len(date_df)
             ))
+    
+    def _get_cached(self, inst_family: str, inst_type: str, start: datetime, end: datetime,
+                    cache_name: str, builder: Callable[[], pl.LazyFrame]) -> pl.LazyFrame:
+        """Helper for get() and get_derived() to handle caching logic."""
+        dates = [start.date() + timedelta(days=i) 
+                 for i in range((end.date() - start.date()).days + 1)]
+        
+        # Check which dates need building
+        missing_dates = [d for d in dates 
+                        if not self.manifest.have(inst_family, inst_type, d, cache_name)]
+        
+        if missing_dates:
+            # Build and cache missing dates
+            lf_missing = builder()
+            self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
+        
+        # Load from cache (all available dates)
+        paths = [str(self._path_for(inst_family, inst_type, d, cache_name)) 
+                 for d in dates if self.manifest.have(inst_family, inst_type, d, cache_name)]
+        lf = pl.scan_parquet(paths) if paths else pl.LazyFrame()
+        
+        # Filter by time range
+        if lf.collect_schema() != {}:
+            start_ms = int(start.timestamp() * 1000)
+            end_ms = int(end.timestamp() * 1000)
+            lf = lf.filter((pl.col('timeMs') >= start_ms) & (pl.col('timeMs') < end_ms))
+        
+        return lf
     
     def get(self, inst_family: str, inst_type: str, start: datetime, end: datetime,
             depth: Optional[int] = None, binning: Optional[str] = None, 
@@ -249,40 +268,51 @@ class OrderbookStore:
         Returns:
             Polars LazyFrame with requested data
         """
-        # Generate date list
-        dates = [start.date() + timedelta(days=i) 
-                 for i in range((end.date() - start.date()).days + 1)]
-        
-        # If cache requested, check which dates need building
         if cache_name:
-            missing_cache_dates = [d for d in dates 
-                                   if not self.manifest.have(inst_family, inst_type, d, cache_name)]
-            
-            if missing_cache_dates:
-                # Build cache only for missing dates
-                lf_missing = self._scan_raw(inst_family, inst_type, missing_cache_dates)
-                lf_missing = self._apply_transforms(lf_missing, depth, binning, features)
-                self._write_cache(lf_missing, inst_family, inst_type, missing_cache_dates, cache_name)
-            
-            # Load from cache (all requested dates that exist)
-            paths = [str(self._path_for(inst_family, inst_type, d, cache_name)) 
-                     for d in dates if self.manifest.have(inst_family, inst_type, d, cache_name)]
-            lf = pl.scan_parquet(paths) if paths else pl.LazyFrame()
+            dates = [start.date() + timedelta(days=i) 
+                     for i in range((end.date() - start.date()).days + 1)]
+            builder = lambda: self._apply_transforms(
+                self._scan_raw(inst_family, inst_type, dates), depth, binning, features
+            )
+            return self._get_cached(inst_family, inst_type, start, end, cache_name, builder)
         else:
             # No caching - compute on-the-fly
-            lf = self._scan_raw(inst_family, inst_type, dates)
-            lf = self._apply_transforms(lf, depth, binning, features)
+            dates = [start.date() + timedelta(days=i) 
+                     for i in range((end.date() - start.date()).days + 1)]
+            return self._apply_transforms(self._scan_raw(inst_family, inst_type, dates), 
+                                         depth, binning, features)
+    
+    def get_derived(self, recipe: Callable[[object, datetime, datetime], pl.LazyFrame], 
+                    cache_name: str, start: datetime, end: datetime) -> pl.LazyFrame:
+        """
+        Get derived data computed from multiple sources via recipe function.
         
-        # Filter by time range
-        if lf.collect_schema() != {}:
-            # Convert datetime to milliseconds for comparison with timeMs
-            start_ms = int(start.timestamp() * 1000)
-            end_ms = int(end.timestamp() * 1000)
-            lf = lf.filter(
-                (pl.col('timeMs') >= start_ms) & (pl.col('timeMs') < end_ms)
-            )
+        Recipe has full access to store and can:
+        - Fetch multiple orderbook streams
+        - Use cached/transformed data
+        - Implement complex logic (graphs, iterations, etc.)
         
-        return lf
+        Args:
+            recipe: Callable with signature (store, start, end) -> LazyFrame
+                   Must return LazyFrame with 'timeMs' column for time filtering
+            cache_name: Cache identifier (e.g., 'forwards_1m', 'iv_surface')
+            start: Start datetime (inclusive)
+            end: End datetime (exclusive)
+        
+        Returns:
+            Polars LazyFrame with derived data
+        
+        Example:
+            def build_forwards(store, start, end):
+                swap = store.get('BTC-USD', 'SWAP', start, end, depth=1, cache_name='d1_1m')
+                futures = store.get('BTC-USD', 'FUTURES', start, end, depth=1, cache_name='d1_1m')
+                # ... merge and compute forwards
+                return forward_lf
+            
+            lf = store.get_derived(build_forwards, 'forwards_1m', start, end)
+        """
+        return self._get_cached('__derived__', '__derived__', start, end, cache_name,
+                               lambda: recipe(self, start, end))
     
     def clear_cache(self, cache_name: Optional[str] = None):
         """
@@ -291,20 +321,24 @@ class OrderbookStore:
         Args:
             cache_name: Specific cache to delete, or None to delete all caches
         """
+        import shutil
         cache_dir = self.root / 'cache'
         
         if cache_name:
-            # Delete specific cache
-            target_dir = cache_dir / cache_name
-            if target_dir.exists():
-                import shutil
-                shutil.rmtree(target_dir)
+            # Delete specific cache (check both regular and derived locations)
+            regular_cache = cache_dir / cache_name
+            derived_cache = cache_dir / 'derived' / cache_name
+            
+            if regular_cache.exists():
+                shutil.rmtree(regular_cache)
+            if derived_cache.exists():
+                shutil.rmtree(derived_cache)
+            
             self.manifest.delete_cache(cache_name)
             print(f"Cleared cache: {cache_name}")
         else:
             # Delete all caches
             if cache_dir.exists():
-                import shutil
                 shutil.rmtree(cache_dir)
                 cache_dir.mkdir()
             

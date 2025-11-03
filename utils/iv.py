@@ -14,9 +14,9 @@ from scipy.interpolate import RBFInterpolator
 import warnings
 import time
 
-from .api import fetch_market_data
+from okx import fetch_market_data, bin_orderbook
+from .helpers import parse_option_name, parse_future_name
 from .black import black76_implied_volatility, black76_implied_volatility_vectorized
-from .helpers import parse_option_name, parse_future_name, bin_orderbook
 from .forward import compute_segment_carry, interpolate_forward
 
 def _build_forward_interpolator(swap_df: pd.DataFrame, futures_df: pd.DataFrame):

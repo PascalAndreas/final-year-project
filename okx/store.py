@@ -8,9 +8,8 @@ import pathlib
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Callable
-import pandas as pd
 import polars as pl
-from .api import fetch_market_data, fetch_orderbook_lazy
+from .api import fetch_orderbook_lazy
 from .helpers import trim_orderbook_polars, bin_orderbook_polars
 
 
@@ -106,10 +105,14 @@ class OrderbookStore:
         if variant == 'raw':
             return (self.root / 'orderbook' / inst_family / inst_type / f'{date_obj.isoformat()}.parquet')
         elif inst_family == '__derived__' and inst_type == '__derived__':
-            # Derived data: cache/derived/{variant}/YYYY-MM-DD.parquet
             return (self.root / 'cache' / 'derived' / variant / f'{date_obj.isoformat()}.parquet')
         else:
             return (self.root / 'cache' / variant / inst_family / inst_type / f'{date_obj.isoformat()}.parquet')
+    
+    def _date_range(self, start: datetime, end: datetime) -> list[date]:
+        """Generate list of dates from start to end (inclusive start, exclusive end)."""
+        return [start.date() + timedelta(days=i) 
+                for i in range((end.date() - start.date()).days)]
     
     def _scan_raw(self, inst_family: str, inst_type: str, dates: list[date]) -> pl.LazyFrame:
         """Scan raw depth=5 orderbook files for given family/type/dates."""
@@ -219,8 +222,7 @@ class OrderbookStore:
     def _get_cached(self, inst_family: str, inst_type: str, start: datetime, end: datetime,
                     cache_name: str, builder: Callable[[], pl.LazyFrame]) -> pl.LazyFrame:
         """Helper for get() and get_derived() to handle caching logic."""
-        dates = [start.date() + timedelta(days=i) 
-                 for i in range((end.date() - start.date()).days + 1)]
+        dates = self._date_range(start, end)
         
         # Check which dates need building
         missing_dates = [d for d in dates 
@@ -268,17 +270,13 @@ class OrderbookStore:
         Returns:
             Polars LazyFrame with requested data
         """
+        dates = self._date_range(start, end)
         if cache_name:
-            dates = [start.date() + timedelta(days=i) 
-                     for i in range((end.date() - start.date()).days + 1)]
             builder = lambda: self._apply_transforms(
                 self._scan_raw(inst_family, inst_type, dates), depth, binning, features
             )
             return self._get_cached(inst_family, inst_type, start, end, cache_name, builder)
         else:
-            # No caching - compute on-the-fly
-            dates = [start.date() + timedelta(days=i) 
-                     for i in range((end.date() - start.date()).days + 1)]
             return self._apply_transforms(self._scan_raw(inst_family, inst_type, dates), 
                                          depth, binning, features)
     
@@ -322,6 +320,22 @@ class OrderbookStore:
         with sqlite3.connect(self.manifest.path) as conn:
             conn.execute("DELETE FROM files WHERE inst_family=? AND inst_type=? AND date=? AND variant='raw'",
                         (inst_family, inst_type, date_obj.isoformat()))
+    
+    def migrate(self, transform_fn: Callable[[pl.LazyFrame], pl.LazyFrame], 
+                variant: str = 'raw', verbose: bool = True):
+        """Apply transformation function to all parquet files in manifest."""
+        with sqlite3.connect(self.manifest.path) as conn:
+            rows = conn.execute("SELECT inst_family, inst_type, date, path FROM files WHERE variant=?", 
+                              (variant,)).fetchall()
+        
+        for i, (inst_family, inst_type, date_str, path_str) in enumerate(rows):
+            if verbose:
+                print(f"[{i+1}/{len(rows)}] Migrating {inst_family}/{inst_type}/{date_str}")
+            path = pathlib.Path(path_str)
+            lf = transform_fn(pl.scan_parquet(path))
+            tmp = path.with_suffix('.parquet.tmp')
+            lf.sink_parquet(str(tmp), compression='zstd')
+            tmp.rename(path)
     
     def clear_cache(self, cache_name: Optional[str] = None):
         """
@@ -427,8 +441,7 @@ def populate(store: OrderbookStore, inst_family: str, inst_type: str,
         verbose: Print progress
     """
     # Determine dates to fetch (end is exclusive)
-    num_days = (end.date() - start.date()).days
-    dates = [start.date() + timedelta(days=i) for i in range(num_days)]
+    dates = store._date_range(start, end)
     missing = [d for d in dates if not store.manifest.have(inst_family, inst_type, d, 'raw')]
     
     if not missing:

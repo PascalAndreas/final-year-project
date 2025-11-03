@@ -16,6 +16,19 @@ def parse_option_name(instrument_name: str):
     
     return f"{parts[0]}-{parts[1]}", expiry_datetime, int(parts[3]), parts[4].upper()
 
+def parse_future_name(instrument_name: str):
+    """Parse futures instrument name into components."""
+    # Remove file extension if present (e.g., 'BTC-USD-250131.OK' -> 'BTC-USD-250131')
+    instrument = instrument_name.split('.')[0]
+    parts = instrument.split('-')
+    if len(parts) != 3:
+        raise ValueError(f"Invalid instrument name format: {instrument}")
+    
+    # Parse date and set expiry time to 08:00 UTC (timezone-naive for pandas compatibility)
+    expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0)
+    
+    return f"{parts[0]}-{parts[1]}", expiry_datetime
+
 def bin_orderbook(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     """Bin orderbook timestamps and keep most recent entry per time bin per symbol.
     Returns filtered df with 'time_bin' and 'timestamp' (binned) columns added.
@@ -32,14 +45,35 @@ def bin_orderbook(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     
     return df
 
-def get_option_combos(df: pd.DataFrame):
-    # Extract expiry/strike pairs from valid instruments
-    combos_df = pd.DataFrame([
-        parse_option_name(inst)[1:3] 
-        for inst in df.iloc[:, 0].unique()
-    ], columns=['expiry', 'strike'])
+def get_option_combos(df: pl.DataFrame | pl.LazyFrame):
+    """Extract unique expiry/strike combinations from options data.
     
-    return combos_df.drop_duplicates().sort_values(['expiry', 'strike']).reset_index(drop=True)
+    Args:
+        df: Polars DataFrame/LazyFrame with 'symbol' column containing option instruments
+        
+    Returns:
+        Polars DataFrame with 'expiry' and 'strike' columns
+    """
+    # Collect if LazyFrame
+    if isinstance(df, pl.LazyFrame):
+        df = df.collect()
+    
+    # Get unique symbols
+    symbols = df.select('symbol').unique().to_series().to_list()
+    
+    # Parse each symbol
+    combos = []
+    for symbol in symbols:
+        try:
+            _, expiry, strike, _ = parse_option_name(symbol)
+            combos.append({'expiry': expiry, 'strike': strike})
+        except ValueError:
+            continue  # Skip invalid symbols
+    
+    # Create and sort DataFrame
+    return (pl.DataFrame(combos)
+            .unique()
+            .sort(['expiry', 'strike']))
 
 def standardize_orderbook_columns(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     """
@@ -78,46 +112,6 @@ def standardize_orderbook_columns(df: pd.DataFrame, filename: str) -> pd.DataFra
             
     return df.rename(columns=rename_map)
 
-def standardize_orderbook_columns_polars(df: pl.DataFrame, filename: str) -> pl.DataFrame:
-    """
-    Standardize orderbook column names from FUTURES format to OPTIONS format (Polars version).
-    E.g. askPx1 -> ask_1_px, bidSz2 -> bid_2_sz
-    Also adds a symbol column from the filename if not present.
-    
-    Only standardizes if needed - if columns are already in the correct format,
-    returns DataFrame unchanged.
-    """
-    # Check if columns are already in the correct format
-    orderbook_cols = [col for col in df.columns if col.startswith(('ask', 'bid'))]
-    if orderbook_cols and all(col.count('_') >= 2 for col in orderbook_cols):
-        # Still need to check for symbol column
-        if 'symbol' not in df.columns:
-            symbol = filename.split('.csv.gz')[0]
-            df = df.with_columns(pl.lit(symbol).alias('symbol'))
-        return df
-    
-    # Add symbol column from filename if not present
-    if 'symbol' not in df.columns:
-        symbol = filename.split('.csv.gz')[0]
-        df = df.with_columns(pl.lit(symbol).alias('symbol'))
-    
-    # Build rename mapping
-    rename_map = {}
-    for col in df.columns:
-        if col.startswith(('ask', 'bid')):
-            num_str = ''.join(filter(str.isdigit, col))
-            if not num_str:
-                continue
-            
-            side = col[:3]
-            col_type = col[3:-len(num_str)].lower()
-            
-            if col_type == 'cnt':
-                col_type = 'ordcnt'
-            
-            rename_map[col] = f"{side}_{num_str}_{col_type}"
-    
-    return df.rename(rename_map)
 
 def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
     """

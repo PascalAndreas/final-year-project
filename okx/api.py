@@ -136,23 +136,19 @@ async def download_csv_async(url: str, output_path: Path, decompress: bool = Tru
 
 
 def _get_orderbook_schema() -> dict:
-    """Get explicit schema for orderbook CSV parsing."""
+    """Get explicit schema for orderbook CSV parsing (depth=5 only)."""
+    schema = {'timeMs': pl.Int64, 'exchTimeMs': pl.Int64}
     
-    schema = {
-        'timeMs': pl.Int64,
-        'exchTimeMs': pl.Int64,
-        # Note: Don't include 'symbol' - we add it from filename instead
-    }
-    
-    # Add all possible orderbook levels (both OPTIONS and FUTURES formats)
-    for i in range(1, 51):
+    # Add depth=5 orderbook levels (both OPTIONS and FUTURES formats)
+    # Prices: Float64 (precision critical), Quantities: Float64, Counts: Int32
+    for i in range(1, 6):
         schema.update({
             f'bid_{i}_px': pl.Float64, f'ask_{i}_px': pl.Float64,
             f'bid_{i}_qty': pl.Float64, f'ask_{i}_qty': pl.Float64,
-            f'bid_{i}_ordCnt': pl.Int64, f'ask_{i}_ordCnt': pl.Int64,
+            f'bid_{i}_ordCnt': pl.Int32, f'ask_{i}_ordCnt': pl.Int32,
             f'bidPx{i}': pl.Float64, f'askPx{i}': pl.Float64,
             f'bidSz{i}': pl.Float64, f'askSz{i}': pl.Float64,
-            f'bidCnt{i}': pl.Int64, f'askCnt{i}': pl.Int64,
+            f'bidCnt{i}': pl.Int32, f'askCnt{i}': pl.Int32,
         })
     
     return schema
@@ -237,22 +233,21 @@ def fetch_orderbook_lazy(inst_family: str, inst_type: str, date_val, temp_base_d
     # Get schema for parsing
     schema = _get_orderbook_schema()
     
-    # Define depth 5 columns
-    depth_5_cols = ['timeMs', 'exchTimeMs', 'symbol']
-    for i in range(1, 6):
-        depth_5_cols.extend([
-            f'bid_{i}_px', f'bid_{i}_qty', f'bid_{i}_ordCnt',
-            f'ask_{i}_px', f'ask_{i}_qty', f'ask_{i}_ordCnt'
-        ])
+    # Define depth=5 columns in standardized format
+    depth_5_cols = ['timeMs', 'exchTimeMs', 'symbol'] + [
+        f'{side}_{i}_{col}' 
+        for i in range(1, 6) 
+        for side in ['bid', 'ask'] 
+        for col in ['px', 'qty', 'ordCnt']
+    ]
     
-    # FUTURES rename map (for lazy application)
-    futures_rename = {}
-    for i in range(1, 6):
-        futures_rename.update({
-            f'bidPx{i}': f'bid_{i}_px', f'askPx{i}': f'ask_{i}_px',
-            f'bidSz{i}': f'bid_{i}_qty', f'askSz{i}': f'ask_{i}_qty',
-            f'bidCnt{i}': f'bid_{i}_ordCnt', f'askCnt{i}': f'ask_{i}_ordCnt',
-        })
+    # FUTURES rename map: old format -> standardized format
+    futures_rename = {
+        f'{side}{old}{i}': f'{side.lower()}_{i}_{new}'
+        for i in range(1, 6)
+        for side in ['bid', 'ask']
+        for old, new in [('Px', 'px'), ('Sz', 'qty'), ('Cnt', 'ordCnt')]
+    }
     
     # Stream each CSV to parquet part
     part_files = []
@@ -291,7 +286,7 @@ def fetch_orderbook_lazy(inst_family: str, inst_type: str, date_val, temp_base_d
                 if 'Ms' in col:
                     null_exprs.append(pl.lit(None, dtype=pl.Int64).alias(col))
                 elif 'ordCnt' in col or 'Cnt' in col:
-                    null_exprs.append(pl.lit(None, dtype=pl.Int64).alias(col))
+                    null_exprs.append(pl.lit(None, dtype=pl.Int32).alias(col))
                 elif col == 'symbol':
                     null_exprs.append(pl.lit(None, dtype=pl.String).alias(col))
                 else:  # price/quantity columns

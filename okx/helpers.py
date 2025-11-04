@@ -3,6 +3,10 @@ import pandas as pd
 import numpy as np
 import polars as pl
 
+# ===============================================================
+# Name parsing functions
+# ===============================================================
+
 def parse_option_name(instrument_name: str):
     """Parse option instrument name into components."""
     # Remove file extension if present (e.g., 'BTC-USD-250627-200000-C.OK' -> 'BTC-USD-250627-200000-C')
@@ -28,22 +32,6 @@ def parse_future_name(instrument_name: str):
     expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0)
     
     return f"{parts[0]}-{parts[1]}", expiry_datetime
-
-def bin_orderbook(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """Bin orderbook timestamps and keep most recent entry per time bin per symbol.
-    Returns filtered df with 'time_bin' and 'timestamp' (binned) columns added.
-    freq: pandas frequency string (e.g., '5min', '1min', '30s', '100ms')"""
-    # Compute time bins without adding to df (more efficient on large dataframes)
-    time_bins = pd.to_datetime(df['timeMs'], unit='ms').dt.ceil(freq)
-    
-    # Group and find most recent entries (only creates temporary groupby object)
-    df = df.loc[df.groupby([time_bins, 'symbol'])['timeMs'].idxmax()]
-    
-    # Now add columns only to filtered df
-    df['time_bin'] = pd.to_datetime(df['timeMs'], unit='ms').dt.ceil(freq)
-    df['timestamp'] = df['time_bin'].astype(np.int64) // 10**6
-    
-    return df
 
 def get_option_combos(df: pl.DataFrame | pl.LazyFrame):
     """Extract unique expiry/strike combinations from options data.
@@ -74,6 +62,70 @@ def get_option_combos(df: pl.DataFrame | pl.LazyFrame):
     return (pl.DataFrame(combos)
             .unique()
             .sort(['expiry', 'strike']))
+
+# ===============================================================
+# Orderbook processing functions (polars)
+# ===============================================================
+
+def trim_orderbook_polars(lf: pl.LazyFrame, n_levels: int = 5) -> pl.LazyFrame:
+    """
+    Trim orderbook LazyFrame to keep only top n levels.
+    """
+    if n_levels == 0:
+        # Calculate mid price and drop all orderbook columns
+        return lf.with_columns([
+            ((pl.col('bid_1_px') + pl.col('ask_1_px')) / 2).alias('mid')
+        ]).select([
+            col for col in lf.collect_schema().names()
+            if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])
+        ] + ['mid'])
+    
+    # Trim to n levels
+    cols_to_keep = [
+        col for col in lf.collect_schema().names()
+        if not any(col.startswith(f'{side}_') for side in ['ask', 'bid']) or
+        (col.split('_')[1].isdigit() and int(col.split('_')[1]) <= n_levels)
+    ]
+    return lf.select(cols_to_keep)
+
+def bin_orderbook_polars(lf: pl.LazyFrame, freq: str) -> pl.LazyFrame:
+    """
+    Bin orderbook timestamps and keep most recent entry per time bin per symbol.
+    Adds a 'time_bin' column with the bin timestamp. Leaves timeMs and exchTimeMs unchanged.
+    freq: Polars duration string (e.g., '5m', '1m', '30s', '100ms')
+    """
+    # Convert timeMs to datetime for grouping
+    return (lf
+        .with_columns(pl.col('timeMs').cast(pl.Datetime('ms')).alias('_ts'))
+        .sort('_ts')
+        .group_by_dynamic('_ts', every=freq, by='symbol', closed='right', label='right')
+        .agg([pl.all().last()])
+        .with_columns(
+            pl.col('_ts').alias('time_bin')  # Keep as datetime
+        )
+        .drop('_ts')
+        .sort(['symbol', 'timeMs'])
+    )
+
+# ===============================================================
+# Orderbook processing functions (pandas)
+# ===============================================================
+
+def bin_orderbook(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Bin orderbook timestamps and keep most recent entry per time bin per symbol.
+    Returns filtered df with 'time_bin' and 'timestamp' (binned) columns added.
+    freq: pandas frequency string (e.g., '5min', '1min', '30s', '100ms')"""
+    # Compute time bins without adding to df (more efficient on large dataframes)
+    time_bins = pd.to_datetime(df['timeMs'], unit='ms').dt.ceil(freq)
+    
+    # Group and find most recent entries (only creates temporary groupby object)
+    df = df.loc[df.groupby([time_bins, 'symbol'])['timeMs'].idxmax()]
+    
+    # Now add columns only to filtered df
+    df['time_bin'] = pd.to_datetime(df['timeMs'], unit='ms').dt.ceil(freq)
+    df['timestamp'] = df['time_bin'].astype(np.int64) // 10**6
+    
+    return df
 
 def standardize_orderbook_columns(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     """
@@ -146,43 +198,3 @@ def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
     ]
     return df[cols_to_keep]
 
-def trim_orderbook_polars(lf: pl.LazyFrame, n_levels: int = 5) -> pl.LazyFrame:
-    """
-    Trim orderbook LazyFrame to keep only top n levels.
-    If n_levels=0, calculates simple mid price (bid_1 + ask_1) / 2 and drops all orderbook columns.
-    """
-    if n_levels == 0:
-        # Calculate mid price and drop all orderbook columns
-        return lf.with_columns([
-            ((pl.col('bid_1_px') + pl.col('ask_1_px')) / 2).alias('mid_price')
-        ]).select([
-            col for col in lf.collect_schema().names()
-            if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])
-        ] + ['mid_price'])
-    
-    # Trim to n levels
-    cols_to_keep = [
-        col for col in lf.collect_schema().names()
-        if not any(col.startswith(f'{side}_') for side in ['ask', 'bid']) or
-        (col.split('_')[1].isdigit() and int(col.split('_')[1]) <= n_levels)
-    ]
-    return lf.select(cols_to_keep)
-
-def bin_orderbook_polars(lf: pl.LazyFrame, freq: str) -> pl.LazyFrame:
-    """
-    Bin orderbook timestamps and keep most recent entry per time bin per symbol.
-    Adds a 'time_bin' column with the bin timestamp. Leaves timeMs and exchTimeMs unchanged.
-    freq: Polars duration string (e.g., '5m', '1m', '30s', '100ms')
-    """
-    # Convert timeMs to datetime for grouping
-    return (lf
-        .with_columns(pl.col('timeMs').cast(pl.Datetime('ms')).alias('_ts'))
-        .sort('_ts')
-        .group_by_dynamic('_ts', every=freq, by='symbol', closed='right', label='right')
-        .agg([pl.all().last()])
-        .with_columns(
-            pl.col('_ts').alias('time_bin')  # Keep as datetime
-        )
-        .drop('_ts')
-        .sort(['symbol', 'timeMs'])
-    )

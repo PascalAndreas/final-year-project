@@ -109,8 +109,17 @@ class OrderbookStore:
         else:
             return (self.root / 'cache' / variant / inst_family / inst_type / f'{date_obj.isoformat()}.parquet')
     
-    def _date_range(self, start: datetime, end: datetime) -> list[date]:
-        """Generate list of dates from start to end (inclusive start, exclusive end)."""
+    def _date_range(self, start: Optional[datetime] = None, end: Optional[datetime] = None,
+                    dates: Optional[list[date]] = None) -> list[date]:
+        """
+        Generate or validate date list.
+        
+        Provide either (start, end) or dates. Returns list of dates.
+        """
+        if dates is not None:
+            return dates
+        if start is None or end is None:
+            raise ValueError("Must provide either 'dates' or both 'start' and 'end'")
         return [start.date() + timedelta(days=i) 
                 for i in range((end.date() - start.date()).days)]
     
@@ -219,98 +228,59 @@ class OrderbookStore:
                 variant=cache_name, path=str(path), rows=len(date_df)
             ))
     
-    def _get_cached(self, inst_family: str, inst_type: str, start: datetime, end: datetime,
-                    cache_name: str, builder: Callable[[], pl.LazyFrame]) -> pl.LazyFrame:
+    def _get(self, inst_family: str, inst_type: str, dates: list[date],
+             builder: Callable[[list[date]], pl.LazyFrame],
+             cache_name: Optional[str] = None) -> pl.LazyFrame:
         """Helper for get() and get_derived() to handle caching logic."""
-        dates = self._date_range(start, end)
+        if cache_name is None:
+            # No caching, just build directly
+            return builder(dates)
         
         # Check which dates need building
         missing_dates = [d for d in dates 
                         if not self.manifest.have(inst_family, inst_type, d, cache_name)]
         
         if missing_dates:
-            # Build and cache missing dates
-            lf_missing = builder()
+            # Build and cache missing dates (builder receives only missing dates)
+            lf_missing = builder(missing_dates)
             self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
         
         # Load from cache (all available dates)
         paths = [str(self._path_for(inst_family, inst_type, d, cache_name)) 
                  for d in dates if self.manifest.have(inst_family, inst_type, d, cache_name)]
-        lf = pl.scan_parquet(paths) if paths else pl.LazyFrame()
-        
-        # Filter by time range
-        if lf.collect_schema() != {}:
-            start_ms = int(start.timestamp() * 1000)
-            end_ms = int(end.timestamp() * 1000)
-            lf = lf.filter((pl.col('timeMs') >= start_ms) & (pl.col('timeMs') < end_ms))
-        
-        return lf
+        return pl.scan_parquet(paths) if paths else pl.LazyFrame()
     
-    def get(self, inst_family: str, inst_type: str, start: datetime, end: datetime,
+    def get(self, inst_family: str, inst_type: str, 
+            start: Optional[datetime] = None, end: Optional[datetime] = None,
+            dates: Optional[list[date]] = None,
             depth: Optional[int] = None, binning: Optional[str] = None, 
             features: Optional[list] = None, cache_name: Optional[str] = None) -> pl.LazyFrame:
         """
         Get orderbook data with optional transformations.
         
-        Args:
-            inst_family: e.g., 'BTC-USD'
-            inst_type: 'SWAP', 'FUTURES', 'OPTION', 'SPOT'
-            start: Start datetime
-            end: End datetime
-            depth: Trim to depth levels (None = full depth=5)
-            binning: Time bin frequency (e.g., '1m', '5m')
-            features: List of features/operations in execution order. Can contain:
-                     - Feature names from FEATURES registry (e.g., 'mid', 'spread')
-                     - Callable functions: func(lf: LazyFrame) -> LazyFrame
-                     - 'trim': Apply depth trimming at this position
-                     - 'bin': Apply time binning at this position
-                     If 'trim'/'bin' not in list, they're applied at the end.
-            cache_name: If provided, use/create cache; if None, compute on-the-fly
-        
-        Returns:
-            Polars LazyFrame with requested data
+        Provide either (start, end) or dates. Features can include registry names,
+        callables, 'trim', or 'bin'. If cache_name provided, result is cached.
         """
-        dates = self._date_range(start, end)
-        if cache_name:
-            builder = lambda: self._apply_transforms(
-                self._scan_raw(inst_family, inst_type, dates), depth, binning, features
-            )
-            return self._get_cached(inst_family, inst_type, start, end, cache_name, builder)
-        else:
-            return self._apply_transforms(self._scan_raw(inst_family, inst_type, dates), 
-                                         depth, binning, features)
+        dates = self._date_range(start, end, dates)
+        
+        builder = lambda dates_to_build: self._apply_transforms(
+            self._scan_raw(inst_family, inst_type, dates_to_build), depth, binning, features
+        )
+        return self._get(inst_family, inst_type, dates, builder, cache_name)
     
-    def get_derived(self, recipe: Callable[[object, datetime, datetime], pl.LazyFrame], 
-                    cache_name: str, start: datetime, end: datetime) -> pl.LazyFrame:
+    def get_derived(self, recipe: Callable[[object, list[date]], pl.LazyFrame],
+                    start: Optional[datetime] = None, end: Optional[datetime] = None,
+                    dates: Optional[list[date]] = None,
+                    cache_name: Optional[str] = None) -> pl.LazyFrame:
         """
-        Get derived data computed from multiple sources via recipe function.
+        Get derived data via recipe function with signature (store, dates) -> LazyFrame.
         
-        Recipe has full access to store and can:
-        - Fetch multiple orderbook streams
-        - Use cached/transformed data
-        - Implement complex logic (graphs, iterations, etc.)
-        
-        Args:
-            recipe: Callable with signature (store, start, end) -> LazyFrame
-                   Must return LazyFrame with 'timeMs' column for time filtering
-            cache_name: Cache identifier (e.g., 'forwards_1m', 'iv_surface')
-            start: Start datetime (inclusive)
-            end: End datetime (exclusive)
-        
-        Returns:
-            Polars LazyFrame with derived data
-        
-        Example:
-            def build_forwards(store, start, end):
-                swap = store.get('BTC-USD', 'SWAP', start, end, depth=1, cache_name='d1_1m')
-                futures = store.get('BTC-USD', 'FUTURES', start, end, depth=1, cache_name='d1_1m')
-                # ... merge and compute forwards
-                return forward_lf
-            
-            lf = store.get_derived(build_forwards, 'forwards_1m', start, end)
+        Provide either (start, end) or dates. If cache_name provided, result is cached.
         """
-        return self._get_cached('__derived__', '__derived__', start, end, cache_name,
-                               lambda: recipe(self, start, end))
+        dates = self._date_range(start, end, dates)
+        
+        builder = lambda dates_to_build: recipe(self, dates_to_build)
+        return self._get('__derived__', '__derived__', dates, builder, cache_name)
     
     def delete_raw(self, inst_family: str, inst_type: str, date_obj: date):
         """Delete raw orderbook file and manifest entry for given family/type/date."""
@@ -425,23 +395,16 @@ def _fetch_and_store_single_date(
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def populate(store: OrderbookStore, inst_family: str, inst_type: str, 
-             start: datetime, end: datetime, max_workers: int = 8, verbose: bool = True):
+def populate(store: OrderbookStore, inst_family: str, inst_type: str,
+             start: Optional[datetime] = None, end: Optional[datetime] = None,
+             dates: Optional[list[date]] = None,
+             max_workers: int = 8, verbose: bool = True):
     """
     Populate raw orderbook data for missing dates (always stores depth=5).
-    Fetches dates in parallel for faster downloads.
     
-    Args:
-        store: OrderbookStore instance
-        inst_family: e.g., 'BTC-USD'
-        inst_type: 'SWAP', 'FUTURES', 'OPTION', 'SPOT'
-        start: Start datetime (inclusive)
-        end: End datetime (exclusive)
-        max_workers: Number of concurrent downloads
-        verbose: Print progress
+    Provide either (start, end) or dates. Fetches dates in parallel for faster downloads.
     """
-    # Determine dates to fetch (end is exclusive)
-    dates = store._date_range(start, end)
+    dates = store._date_range(start, end, dates)
     missing = [d for d in dates if not store.manifest.have(inst_family, inst_type, d, 'raw')]
     
     if not missing:

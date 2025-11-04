@@ -10,7 +10,7 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Callable
 import polars as pl
 from .api import fetch_orderbook_lazy
-from .helpers import trim_orderbook_polars, bin_orderbook_polars
+from .helpers import trim_orderbook_polars, bin_orderbook_polars, add_tenor_polars
 
 
 # Common feature expressions for derived orderbooks
@@ -91,14 +91,17 @@ class Manifest:
 class OrderbookStore:
     """Storage manager for raw orderbooks and derived caches."""
     
-    def __init__(self, data_root: str | pathlib.Path, manifest_path: str | pathlib.Path):
+    def __init__(self, data_root: str | pathlib.Path, manifest_path: str | pathlib.Path,
+                 batch_days: Optional[int] = None):
         """
         Args:
             data_root: Root directory for orderbook/ and cache/ subdirs
             manifest_path: Path to SQLite manifest database
+            batch_days: If set, process dates in batches of this size to avoid memory issues
         """
         self.root = pathlib.Path(data_root)
         self.manifest = Manifest(pathlib.Path(manifest_path))
+        self.batch_days = batch_days
     
     def _path_for(self, inst_family: str, inst_type: str, date_obj: date, variant: str = 'raw') -> pathlib.Path:
         """Generate parquet path for family/type/date/variant."""
@@ -136,8 +139,9 @@ class OrderbookStore:
         
         return pl.scan_parquet(paths)
     
-    def _apply_transforms(self, lf: pl.LazyFrame, depth: Optional[int], 
-                          binning: Optional[str], features: Optional[list]) -> pl.LazyFrame:
+    def _apply_transforms(self, lf: pl.LazyFrame, inst_family: str, inst_type: str,
+                          depth: Optional[int], binning: Optional[str], 
+                          features: Optional[list]) -> pl.LazyFrame:
         """
         Apply transformations in order specified by features list.
         
@@ -177,6 +181,10 @@ class OrderbookStore:
                 if binning is not None:
                     lf = bin_orderbook_polars(lf, binning)
                     bin_applied = True
+            elif feat == 'tenor':
+                # Add expiry and T columns by parsing symbol
+                lf, feature_exprs = _flush(lf, feature_exprs)
+                lf = add_tenor_polars(lf, inst_type)
             elif isinstance(feat, str):
                 # Registry feature
                 if feat not in FEATURES:
@@ -231,21 +239,47 @@ class OrderbookStore:
     def _get(self, inst_family: str, inst_type: str, dates: list[date],
              builder: Callable[[list[date]], pl.LazyFrame],
              cache_name: Optional[str] = None) -> pl.LazyFrame:
-        """Helper for get() and get_derived() to handle caching logic."""
+        """Helper for get() and get_derived() to handle caching logic with optional batching."""
+        # Determine if we need batching
+        if self.batch_days is None or len(dates) <= self.batch_days:
+            # No batching needed - use original logic
+            if cache_name is None:
+                return builder(dates)
+            
+            # Check which dates need building
+            missing_dates = [d for d in dates 
+                            if not self.manifest.have(inst_family, inst_type, d, cache_name)]
+            
+            if missing_dates:
+                lf_missing = builder(missing_dates)
+                self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
+            
+            # Load from cache
+            paths = [str(self._path_for(inst_family, inst_type, d, cache_name)) 
+                     for d in dates if self.manifest.have(inst_family, inst_type, d, cache_name)]
+            return pl.scan_parquet(paths) if paths else pl.LazyFrame()
+        
+        # Batching enabled: split dates into batches
+        batch_size = self.batch_days
+        batches = [dates[i:i + batch_size] for i in range(0, len(dates), batch_size)]
+        
         if cache_name is None:
-            # No caching, just build directly
-            return builder(dates)
+            # No caching: build each batch and concatenate
+            batch_results = []
+            for batch_dates in batches:
+                lf_batch = builder(batch_dates)
+                batch_results.append(lf_batch)
+            return pl.concat(batch_results) if batch_results else pl.LazyFrame()
         
-        # Check which dates need building
-        missing_dates = [d for d in dates 
-                        if not self.manifest.have(inst_family, inst_type, d, cache_name)]
+        # With caching: process each batch, cache immediately, then load all
+        for batch_dates in batches:
+            missing_dates = [d for d in batch_dates 
+                            if not self.manifest.have(inst_family, inst_type, d, cache_name)]
+            if missing_dates:
+                lf_missing = builder(missing_dates)
+                self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
         
-        if missing_dates:
-            # Build and cache missing dates (builder receives only missing dates)
-            lf_missing = builder(missing_dates)
-            self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
-        
-        # Load from cache (all available dates)
+        # Load all requested dates from cache
         paths = [str(self._path_for(inst_family, inst_type, d, cache_name)) 
                  for d in dates if self.manifest.have(inst_family, inst_type, d, cache_name)]
         return pl.scan_parquet(paths) if paths else pl.LazyFrame()
@@ -264,7 +298,8 @@ class OrderbookStore:
         dates = self._date_range(start, end, dates)
         
         builder = lambda dates_to_build: self._apply_transforms(
-            self._scan_raw(inst_family, inst_type, dates_to_build), depth, binning, features
+            self._scan_raw(inst_family, inst_type, dates_to_build), 
+            inst_family, inst_type, depth, binning, features
         )
         return self._get(inst_family, inst_type, dates, builder, cache_name)
     

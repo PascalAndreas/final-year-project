@@ -107,6 +107,33 @@ def bin_orderbook_polars(lf: pl.LazyFrame, freq: str) -> pl.LazyFrame:
         .sort(['symbol', 'timeMs'])
     )
 
+def add_tenor_polars(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
+    """
+    Add expiry and T (time to maturity in years) by parsing symbols.
+    
+    For FUTURES/OPTION: parses expiry from symbol
+    For SWAP: sets expiry to far future (T effectively 0)
+    """
+    df = lf.collect()
+    if df.is_empty():
+        return lf
+    
+    # Parse expiry based on instrument type
+    if inst_type == 'FUTURES':
+        expiry = df['symbol'].map_elements(lambda s: parse_future_name(s)[1], return_dtype=pl.Datetime(time_zone=None))
+    elif inst_type == 'OPTION':
+        expiry = df['symbol'].map_elements(lambda s: parse_option_name(s)[1], return_dtype=pl.Datetime(time_zone=None))
+    elif inst_type == 'SWAP':
+        expiry = pl.lit(datetime(2099, 12, 31, 8, 0, 0))
+    else:
+        return df.lazy()
+    
+    # Add expiry and T columns
+    return df.with_columns([
+        expiry.alias('expiry'),
+        ((expiry.dt.epoch('ms') - pl.col('timeMs')) / 1000.0 / (365.25 * 24 * 3600)).alias('T')
+    ]).lazy()
+
 # ===============================================================
 # Orderbook processing functions (pandas)
 # ===============================================================

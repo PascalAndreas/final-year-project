@@ -36,15 +36,19 @@ from okx.store import OrderbookStore, populate, FEATURES
 
 store = OrderbookStore(
     data_root="data/okx",
-    manifest_path="data/okx/manifest.sqlite"
+    manifest_path="data/okx/manifest.sqlite",
+    batch_days=7  # Optional: process dates in batches to avoid memory issues
 )
 ```
+
+The `batch_days` parameter is useful when working with large date ranges (e.g., 2+ months). When set, data is processed in batches of the specified number of days, reducing memory usage.
 
 ### Populate Raw Data
 
 ```python
-from datetime import datetime
+from datetime import datetime, date
 
+# Using start/end datetime
 populate(
     store,
     inst_family='BTC-USD',
@@ -54,12 +58,21 @@ populate(
     max_workers=8,  # Parallel downloads
     verbose=True
 )
+
+# Or using explicit date list
+populate(
+    store,
+    inst_family='BTC-USD',
+    inst_type='SWAP',
+    dates=[date(2025, 9, 1), date(2025, 9, 2), date(2025, 9, 3)],
+    max_workers=8
+)
 ```
 
 - Only fetches missing dates (incremental updates)
 - Always stores full depth=5 orderbook snapshots
 - Downloads dates in parallel for speed (configurable with `max_workers`)
-- `end` date is exclusive
+- Provide either `(start, end)` or `dates` parameter
 
 ### Query Data
 
@@ -91,6 +104,11 @@ lf = store.get(
 ```
 
 ### Features
+
+**Special features** (built-in with special handling):
+- `'tenor'`: Parses instrument symbols to add `expiry` (datetime) and `T` (time to maturity in years) columns. Handles FUTURES, OPTION, and SWAP instruments.
+- `'trim'`: Apply depth trimming at this position in the pipeline
+- `'bin'`: Apply time binning at this position in the pipeline
 
 **Registry features** (from `FEATURES` dict):
 - `mid`: (ask_1_px + bid_1_px) / 2
@@ -146,6 +164,52 @@ store.clear_cache('d1_1m')
 store.clear_cache()
 ```
 
+### Derived Data (Recipes)
+
+For complex computations that combine multiple data sources (e.g., forward curves from SWAP + FUTURES), use `get_derived()` with recipe functions:
+
+```python
+from datetime import datetime
+from functools import partial
+
+def build_forward_curve(store, dates):
+    """Recipe signature: (store, dates) -> LazyFrame"""
+    if not dates:
+        return pl.LazyFrame()
+    
+    # Fetch SWAP and FUTURES data
+    swap = store.get('BTC-USD', 'SWAP', dates=dates, depth=1, 
+                     binning='5m', features=['tenor', 'rel_spread'],
+                     cache_name='d1_5m_pillars')
+    futures = store.get('BTC-USD', 'FUTURES', dates=dates, depth=1,
+                        binning='5m', features=['tenor', 'rel_spread'],
+                        cache_name='d1_5m_pillars')
+    
+    # ... complex forward curve computation ...
+    return forward_curve_lf
+
+# Query with caching
+lf = store.get_derived(
+    build_forward_curve,
+    start=datetime(2025, 9, 1),
+    end=datetime(2025, 9, 5),
+    cache_name='forwards_5m'  # Optional: cache the result
+)
+
+# Or use functools.partial to configure recipes
+from okx.recipes.forwards import build_forwards_pchip
+
+recipe = partial(build_forwards_pchip, binning='5m', lambda_ewma=0.8)
+lf = store.get_derived(recipe, start=start, end=end, cache_name='forwards_pchip_5m')
+```
+
+**Key features:**
+- Recipe signature: `(store, dates) -> pl.LazyFrame`
+- Full access to store for fetching multiple sources
+- Optional caching with `cache_name`
+- Supports both `(start, end)` and `dates` parameters
+- Batching handled automatically if `batch_days` is set on store
+
 ## Transformation Pipeline
 
 When you call `store.get()` with transformations:
@@ -159,43 +223,6 @@ When you call `store.get()` with transformations:
 4. **Cache (optional)** - Write transformed data to cache layer (split by date)
 
 All operations are lazy until `.collect()` is called. If caching is enabled, the cache is built incrementally (only missing dates are computed).
-
-## Integration with Existing Code
-
-### Before (old API)
-
-```python
-from okx.api import fetch_market_data
-from okx.helpers import bin_orderbook
-
-# Fetch on every run
-swap_df = fetch_market_data(
-    inst_family='BTC-USD', inst_type='SWAP', 
-    start=start, end=end, depth=1
-)
-swap_df = bin_orderbook(swap_df, '5m')
-```
-
-### After (store-based)
-
-```python
-from okx.store import OrderbookStore, populate
-from datetime import datetime
-
-store = OrderbookStore("data/okx", "data/okx/manifest.sqlite")
-
-# One-time populate (only fetches missing dates)
-populate(store, inst_family='BTC-USD', inst_type='SWAP', 
-         start=datetime(2025, 9, 1), end=datetime(2025, 9, 30))
-
-# Query with caching (instant on subsequent runs)
-swap_lf = store.get(
-    inst_family='BTC-USD', inst_type='SWAP',
-    start=datetime(2025, 9, 1), end=datetime(2025, 9, 5),
-    depth=1, binning='5m', cache_name='swap_5m'
-)
-swap_df = swap_lf.collect().to_pandas()  # Convert to pandas if needed
-```
 
 ## Benefits
 
@@ -219,16 +246,21 @@ swap_df = swap_lf.collect().to_pandas()  # Convert to pandas if needed
 
 ### Key Files
 
-- `okx/store.py` - Main storage infrastructure (~430 lines)
+- `okx/store.py` - Main storage infrastructure (~480 lines)
   - `Manifest` class - SQLite manifest management
-  - `OrderbookStore` class - Main API
+  - `OrderbookStore` class - Main API with batching support
   - `FEATURES` registry - Common feature expressions
   - `populate()` function - Parallel fetching and storage
-  - `_fetch_and_store_single_date()` - Single-date fetcher (for parallel execution)
+  - `get()` - Query with transformations and caching
+  - `get_derived()` - Execute recipes combining multiple sources
 
 - `okx/helpers.py` - Helper functions
   - `trim_orderbook_polars()` - Depth trimming for Polars
   - `bin_orderbook_polars()` - Time binning for Polars
+  - `add_tenor_polars()` - Parse symbols to add expiry and T columns
+
+- `okx/recipes/` - Recipe functions for derived data
+  - `forwards.py` - Forward curve construction (PCHIP and Kalman methods)
 
 - `okx/api.py` - Data fetching
   - `fetch_orderbook_lazy()` - Streaming fetch that returns LazyFrame
@@ -246,6 +278,9 @@ swap_df = swap_lf.collect().to_pandas()  # Convert to pandas if needed
 - **Incremental updates** - Manifest tracks what exists, only fetch/compute what's missing
 - **Streaming writes** - Use `sink_parquet()` to avoid materializing large datasets
 - **Configurable feature ordering** - Allow `'trim'` and `'bin'` in features list for precise control
+- **Optional batching** - Process large date ranges in configurable batches to manage memory
+- **Recipe system** - `get_derived()` for complex multi-source computations with same caching semantics
+- **Flexible date specification** - Accept either `(start, end)` datetime range or explicit `dates` list
 
 ## Example Workflow
 

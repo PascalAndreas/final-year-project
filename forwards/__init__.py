@@ -35,7 +35,6 @@ from .evaluation import (
 from .utils import (
     datetime_to_year_fraction,
     compute_weights,
-    apply_early_roll_filter,
 )
 
 __all__ = [
@@ -64,8 +63,5 @@ __all__ = [
     # Utils
     "datetime_to_year_fraction",
     "compute_weights",
-    "apply_early_roll_filter",
-    "parse_futures_expiry",
-    "add_expiry_and_ttm",
 ]
 

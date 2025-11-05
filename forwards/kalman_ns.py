@@ -268,13 +268,13 @@ def kalman_filter(
             - 'T_pillars': Array of maturities
             - 'F_bid_pillars': Bid prices
             - 'F_ask_pillars': Ask prices
-            - 'spreads': Bid-ask spreads (for measurement noise)
+            - 'rel_spreads': Relative bid-ask spreads (for measurement noise)
             - 'F_ref_bid': Reference bid (swap)
             - 'F_ref_ask': Reference ask (swap)
         lambda_ns: Shape parameter
         process_noise_scale: Process noise scale
         ar1_coef: AR(1) coefficient
-        spread_to_variance_scale: Scale to convert spread to measurement variance
+        spread_to_variance_scale: Scale to convert relative spread to measurement variance
         
     Returns:
         List of NSCarryState objects
@@ -289,13 +289,12 @@ def kalman_filter(
         T_pillars = snap['T_pillars']
         F_bid_pillars = snap['F_bid_pillars']
         F_ask_pillars = snap['F_ask_pillars']
-        spreads = snap['spreads']
+        rel_spreads = snap['rel_spreads']
         F_ref_bid = snap['F_ref_bid']
         F_ref_ask = snap['F_ref_ask']
         
-        # Measurement noise from spreads (wider spread = more uncertain)
-        # Variance in log-price space: (spread/price)^2
-        rel_spreads = spreads / ((F_bid_pillars + F_ask_pillars) / 2)
+        # Measurement noise from relative spreads (wider spread = more uncertain)
+        # Variance in log-price space: rel_spread^2
         measurement_vars = (rel_spreads ** 2) * spread_to_variance_scale
         measurement_vars = np.maximum(measurement_vars, 1e-8)  # Floor to avoid numerical issues
         

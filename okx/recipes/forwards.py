@@ -21,6 +21,15 @@ from forwards.kalman_ns import kalman_filter, states_to_polars
 from forwards.utils import compute_weights
 
 
+def _drop_unneeded_columns(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Drop columns not needed for forward curve fitting."""
+    needed_columns = ['timeMs', 'symbol', 'bid_1_px', 'ask_1_px']
+    # Keep only columns that exist in the frame
+    existing_columns = lf.collect_schema().names()
+    keep_columns = [col for col in needed_columns if col in existing_columns]
+    return lf.select(keep_columns)
+
+
 def _finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
     """
     Finalize binning by promoting time_bin to timeMs and dropping old time columns.
@@ -29,7 +38,7 @@ def _finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
     This function converts it to epoch milliseconds (int64) to match timeMs format.
     """
     return (lf
-        .drop('timeMs', 'exchTimeMs')
+        .drop('timeMs')
         .with_columns(pl.col('time_bin').dt.epoch('ms').alias('timeMs'))
         .drop('time_bin')
     )
@@ -60,7 +69,7 @@ def prepare_pillars(
     the most recent swap snapshot and all valid futures contracts at that time.
     """
     # Build feature list (ordered for performance: trim early to reduce columns)
-    features_base = ['trim']
+    features_base = ['trim', _drop_unneeded_columns]
     if binning:
         features_base.append('bin')
     features_base.extend(['spread', 'rel_spread', 'tenor'])
@@ -75,7 +84,7 @@ def prepare_pillars(
     features_futures.append(_make_early_roll_filter(min_time_to_expiry_hours))
     
     # Build cache name if binning
-    cache_name = f"d1_{binning}{cache_name_suffix}" if binning else None
+    cache_name = f"{binning}{cache_name_suffix}" if binning else None
     
     # Shared parameters
     shared_params = {
@@ -285,14 +294,14 @@ def build_forwards_kalman(
         T_pillars = futures['T'].to_numpy()
         F_bid_pillars = futures['bid_1_px'].to_numpy()
         F_ask_pillars = futures['ask_1_px'].to_numpy()
-        spreads = futures['spread'].to_numpy()
+        rel_spreads = futures['rel_spread'].to_numpy()
         
         snapshots.append({
             'timeMs': int(timeMs),
             'T_pillars': T_pillars,
             'F_bid_pillars': F_bid_pillars,
             'F_ask_pillars': F_ask_pillars,
-            'spreads': spreads,
+            'rel_spreads': rel_spreads,
             'F_ref_bid': F_ref_bid,
             'F_ref_ask': F_ref_ask,
         })

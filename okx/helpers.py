@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import polars as pl
@@ -15,8 +15,8 @@ def parse_option_name(instrument_name: str):
     if len(parts) != 5:
         raise ValueError(f"Invalid instrument name format: {instrument}")
     
-    # Parse date and set expiry time to 08:00 UTC (timezone-naive for pandas compatibility)
-    expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0)
+    # Parse date and set expiry time to 08:00 UTC
+    expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
     
     return f"{parts[0]}-{parts[1]}", expiry_datetime, int(parts[3]), parts[4].upper()
 
@@ -28,8 +28,8 @@ def parse_future_name(instrument_name: str):
     if len(parts) != 3:
         raise ValueError(f"Invalid instrument name format: {instrument}")
     
-    # Parse date and set expiry time to 08:00 UTC (timezone-naive for pandas compatibility)
-    expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0)
+    # Parse date and set expiry time to 08:00 UTC
+    expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
     
     return f"{parts[0]}-{parts[1]}", expiry_datetime
 
@@ -130,7 +130,7 @@ def add_tenor_polars(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
             return_dtype=pl.Int64
         )
     elif inst_type == 'SWAP':
-        expiry_ms = pl.lit(int(datetime(2099, 12, 31, 8, 0, 0).timestamp() * 1000))
+        expiry_ms = pl.lit(int(datetime(2099, 12, 31, 8, 0, 0, tzinfo=timezone.utc).timestamp() * 1000))
     else:
         return df.lazy()
     

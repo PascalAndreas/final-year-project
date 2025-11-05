@@ -18,18 +18,30 @@ from typing import Optional
 
 from forwards.pchip import fit_pchip_curve, ewma_smooth, curves_to_polars, PCHIPCurve
 from forwards.kalman_ns import kalman_filter, states_to_polars
-from forwards.utils import apply_early_roll_filter, compute_weights
+from forwards.utils import compute_weights
 
 
 def _finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
     """
     Finalize binning by promoting time_bin to timeMs and dropping old time columns.
     
-    After binning, time_bin contains the aligned timestamps. This function:
-    - Drops the original timeMs and exchTimeMs columns
-    - Renames time_bin to timeMs
+    After binning, time_bin contains the aligned timestamps as datetime.
+    This function converts it to epoch milliseconds (int64) to match timeMs format.
     """
-    return lf.drop('timeMs', 'exchTimeMs').rename({'time_bin': 'timeMs'})
+    return (lf
+        .drop('timeMs', 'exchTimeMs')
+        .with_columns(pl.col('time_bin').dt.epoch('ms').alias('timeMs'))
+        .drop('time_bin')
+    )
+
+
+def _make_early_roll_filter(min_time_to_expiry_hours: float):
+    """Create early-roll filter callable for use in feature pipeline."""
+    def filter_fn(lf: pl.LazyFrame) -> pl.LazyFrame:
+        min_seconds = min_time_to_expiry_hours * 3600
+        time_to_expiry_seconds = (pl.col('expiry') - pl.col('timeMs')) / 1000.0
+        return lf.filter(time_to_expiry_seconds >= min_seconds)
+    return filter_fn
 
 
 def prepare_pillars(
@@ -37,48 +49,55 @@ def prepare_pillars(
     inst_family: str,
     dates: list[date],
     binning: Optional[str] = None,
-    depth: int = 1,
     min_time_to_expiry_hours: float = 2.0,
     cache_name_suffix: str = "_pillars",
-) -> tuple[pl.DataFrame, pl.DataFrame]:
+    unique_times: Optional[list[int]] = None,
+) -> dict[int, tuple[pl.DataFrame, pl.DataFrame]]:
     """
-    Prepare pillar data from SWAP and FUTURES orderbooks.
+    Prepare pillar data from SWAP and FUTURES orderbooks with timestamp matching.
     
-    Returns (df_swap, df_futures) with early-roll filter applied to futures.
+    Returns dict mapping timeMs -> (swap_row, futures_df) where each entry contains
+    the most recent swap snapshot and all valid futures contracts at that time.
     """
-    # Build feature list (ordered for performance: bin early to reduce rows, trim early to reduce columns)
-    features = []
+    # Build feature list (ordered for performance: trim early to reduce columns)
+    features_base = ['trim']
     if binning:
-        features.append('bin')
-    features.extend(['rel_spread', 'trim', 'tenor'])
+        features_base.append('bin')
+    features_base.extend(['spread', 'rel_spread', 'tenor'])
     if binning:
-        features.append(_finalize_binning)
+        features_base.append(_finalize_binning)
     
-    # Shared fetch parameters
-    fetch_params = {
-        'inst_family': inst_family,
-        'dates': dates,
-        'depth': depth,
-        'binning': binning,
-        'features': features,
-    }
+    # SWAP features (no early-roll filter)
+    features_swap = features_base.copy()
+    
+    # FUTURES features (add early-roll filter after tenor)
+    features_futures = features_base.copy()
+    features_futures.append(_make_early_roll_filter(min_time_to_expiry_hours))
     
     # Build cache name if binning
-    if binning:
-        cache_name = f"d{depth}_{binning}{cache_name_suffix}"
+    cache_name = f"d1_{binning}{cache_name_suffix}" if binning else None
+    
+    # Shared parameters
+    shared_params = {
+        'inst_family': inst_family,
+        'dates': dates,
+        'depth': 1,
+        'binning': binning,
+        'cache_name': cache_name,
+    }
     
     # Fetch SWAP (perpetual)
     lf_swap = store.get(
         inst_type='SWAP',
-        cache_name=cache_name if binning else None,
-        **fetch_params
+        features=features_swap,
+        **shared_params,
     )
     
     # Fetch FUTURES
     lf_futures = store.get(
         inst_type='FUTURES',
-        cache_name=cache_name if binning else None,
-        **fetch_params
+        features=features_futures,
+        **shared_params,
     )
     
     # Collect
@@ -86,17 +105,54 @@ def prepare_pillars(
     df_futures = lf_futures.collect()
     
     if df_swap.is_empty() or df_futures.is_empty():
-        return pl.DataFrame(), pl.DataFrame()
+        return {}
     
-    # Apply early-roll filter to futures (drop near-expiry contracts)
-    df_futures = apply_early_roll_filter(
-        df_futures,
-        current_time_col='timeMs',
-        expiry_col='expiry',
-        min_time_to_expiry_hours=min_time_to_expiry_hours,
-    )
+    # Determine timestamps
+    if unique_times is not None:
+        times = sorted(unique_times)
+    else:
+        # Union of all timestamps from both dataframes
+        times = pl.concat([
+            df_swap.select('timeMs'),
+            df_futures.select('timeMs')
+        ]).unique().sort('timeMs')['timeMs'].to_list()
     
-    return df_swap, df_futures
+    # Build snapshot dict
+    snapshots = {}
+    df_swap_sorted = df_swap.sort('timeMs')
+    unique_symbols = df_futures['symbol'].unique().to_list()
+    
+    for time in times:
+        df_time = pl.DataFrame({'timeMs': [time]})
+        
+        # Get most recent swap snapshot at or before this time
+        swap_matched = df_time.join_asof(df_swap_sorted, on='timeMs', strategy='backward')
+        if swap_matched.is_empty() or swap_matched['bid_1_px'][0] is None:
+            continue
+        
+        # Get most recent snapshot for each futures symbol at or before this time
+        futures_at_time = []
+        for symbol in unique_symbols:
+            symbol_data = df_futures.filter(pl.col('symbol') == symbol).sort('timeMs')
+            if symbol_data.is_empty():
+                continue
+            matched = df_time.join_asof(symbol_data, on='timeMs', strategy='backward')
+            # Filter where expiry > timeMs (not expired) and has valid data
+            matched = matched.filter(
+                (pl.col('expiry') > pl.col('timeMs')) & 
+                (pl.col('bid_1_px').is_not_null())
+            )
+            if not matched.is_empty():
+                futures_at_time.append(matched)
+        
+        if not futures_at_time:
+            continue
+        
+        # Concatenate all valid futures for this time
+        futures_df = pl.concat(futures_at_time)
+        snapshots[time] = (swap_matched, futures_df)
+    
+    return snapshots
 
 
 def build_forwards_pchip(
@@ -125,46 +181,19 @@ def build_forwards_pchip(
     if not dates:
         return pl.LazyFrame()
     
-    # Prepare pillar data
-    df_swap, df_futures = prepare_pillars(
-        store, inst_family, dates, binning, min_time_to_expiry_hours=min_time_to_expiry_hours
+    # Prepare pillar data with timestamp matching
+    snapshots = prepare_pillars(
+        store, inst_family, dates, binning, 
+        min_time_to_expiry_hours=min_time_to_expiry_hours,
+        unique_times=unique_times
     )
     
-    if df_swap.is_empty() or df_futures.is_empty():
+    if not snapshots:
         return pl.LazyFrame()
-    
-    # Determine timestamps for curve construction
-    if unique_times is not None:
-        # Use provided timestamps
-        times = sorted(unique_times)
-    elif binning:
-        # Use binned timestamps (already aligned)
-        times = df_swap['timeMs'].unique().sort().to_list()
-    else:
-        # Union of all timestamps from both dataframes
-        times = pl.concat([
-            df_swap.select('timeMs'),
-            df_futures.select('timeMs')
-        ]).unique().sort()['timeMs'].to_list()
-    
-    # Match timestamps using asof join for snapshot matching
-    df_times = pl.DataFrame({'timeMs': times})
-    df_swap_matched = df_times.join_asof(df_swap, on='timeMs', strategy='backward')
-    df_futures_matched = df_times.join_asof(df_futures, on='timeMs', strategy='backward')
     
     curves = []
     
-    for timeMs in times:
-        # Get snapshot at this time (single row for swap, multiple rows for futures)
-        swap = df_swap_matched.filter(pl.col('timeMs') == timeMs)
-        futures = df_futures_matched.filter(pl.col('timeMs') == timeMs)
-        
-        if swap.is_empty() or futures.is_empty():
-            continue
-        
-        # Check for null values (no match found in asof join)
-        if swap['bid_1_px'][0] is None or futures['bid_1_px'][0] is None:
-            continue
+    for timeMs, (swap, futures) in snapshots.items():
         
         # Extract swap anchor
         F_bid_swap = swap['bid_1_px'][0]
@@ -234,46 +263,19 @@ def build_forwards_kalman(
     if not dates:
         return pl.LazyFrame()
     
-    # Prepare pillar data
-    df_swap, df_futures = prepare_pillars(
-        store, inst_family, dates, binning, min_time_to_expiry_hours=min_time_to_expiry_hours
+    # Prepare pillar data with timestamp matching
+    snapshots_dict = prepare_pillars(
+        store, inst_family, dates, binning,
+        min_time_to_expiry_hours=min_time_to_expiry_hours,
+        unique_times=unique_times
     )
     
-    if df_swap.is_empty() or df_futures.is_empty():
+    if not snapshots_dict:
         return pl.LazyFrame()
-    
-    # Determine timestamps for curve construction
-    if unique_times is not None:
-        # Use provided timestamps
-        times = sorted(unique_times)
-    elif binning:
-        # Use binned timestamps (already aligned)
-        times = df_swap['timeMs'].unique().sort().to_list()
-    else:
-        # Union of all timestamps from both dataframes
-        times = pl.concat([
-            df_swap.select('timeMs'),
-            df_futures.select('timeMs')
-        ]).unique().sort()['timeMs'].to_list()
-    
-    # Match timestamps using asof join for snapshot matching
-    df_times = pl.DataFrame({'timeMs': times})
-    df_swap_matched = df_times.join_asof(df_swap, on='timeMs', strategy='backward')
-    df_futures_matched = df_times.join_asof(df_futures, on='timeMs', strategy='backward')
     
     snapshots = []
     
-    for timeMs in times:
-        # Get snapshot at this time
-        swap = df_swap_matched.filter(pl.col('timeMs') == timeMs)
-        futures = df_futures_matched.filter(pl.col('timeMs') == timeMs)
-        
-        if swap.is_empty() or futures.is_empty():
-            continue
-        
-        # Check for null values (no match found in asof join)
-        if swap['bid_1_px'][0] is None or futures['bid_1_px'][0] is None:
-            continue
+    for timeMs, (swap, futures) in snapshots_dict.items():
         
         # Extract swap reference
         F_ref_bid = swap['bid_1_px'][0]

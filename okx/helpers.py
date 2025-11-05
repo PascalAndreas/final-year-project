@@ -109,7 +109,7 @@ def bin_orderbook_polars(lf: pl.LazyFrame, freq: str) -> pl.LazyFrame:
 
 def add_tenor_polars(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
     """
-    Add expiry and T (time to maturity in years) by parsing symbols.
+    Add expiry (ms) and T (time to maturity in years) by parsing symbols.
     
     For FUTURES/OPTION: parses expiry from symbol
     For SWAP: sets expiry to far future (T effectively 0)
@@ -118,20 +118,26 @@ def add_tenor_polars(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
     if df.is_empty():
         return lf
     
-    # Parse expiry based on instrument type
+    # Parse expiry based on instrument type (as milliseconds)
     if inst_type == 'FUTURES':
-        expiry = df['symbol'].map_elements(lambda s: parse_future_name(s)[1], return_dtype=pl.Datetime(time_zone=None))
+        expiry_ms = df['symbol'].map_elements(
+            lambda s: int(parse_future_name(s)[1].timestamp() * 1000), 
+            return_dtype=pl.Int64
+        )
     elif inst_type == 'OPTION':
-        expiry = df['symbol'].map_elements(lambda s: parse_option_name(s)[1], return_dtype=pl.Datetime(time_zone=None))
+        expiry_ms = df['symbol'].map_elements(
+            lambda s: int(parse_option_name(s)[1].timestamp() * 1000), 
+            return_dtype=pl.Int64
+        )
     elif inst_type == 'SWAP':
-        expiry = pl.lit(datetime(2099, 12, 31, 8, 0, 0))
+        expiry_ms = pl.lit(int(datetime(2099, 12, 31, 8, 0, 0).timestamp() * 1000))
     else:
         return df.lazy()
     
-    # Add expiry and T columns
+    # Add expiry (ms) and T columns
     return df.with_columns([
-        expiry.alias('expiry'),
-        ((expiry.dt.epoch('ms') - pl.col('timeMs')) / 1000.0 / (365.25 * 24 * 3600)).alias('T')
+        expiry_ms.alias('expiry'),
+        ((expiry_ms - pl.col('timeMs')) / 1000.0 / (365.25 * 24 * 3600)).alias('T')
     ]).lazy()
 
 # ===============================================================

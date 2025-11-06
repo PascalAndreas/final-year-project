@@ -10,8 +10,8 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Callable
 import polars as pl
 from .api import fetch_orderbook_lazy
-from .helpers import trim_orderbook_polars, bin_orderbook_polars, add_tenor_polars
-
+from .helpers import trim_orderbook_polars, bin_orderbook_polars, add_tenor_polars, log_prices_polars, exp_prices_polars
+from tqdm.auto import tqdm
 
 # Common feature expressions for derived orderbooks
 # 
@@ -165,36 +165,43 @@ class OrderbookStore:
                 frame = frame.with_columns(exprs)
             return frame, []
         
+        # Callable features that require flushing before execution
+        # Each returns (LazyFrame, was_applied: bool)
+        FLUSH_FEATURES = {
+            'trim': lambda lf: (trim_orderbook_polars(lf, depth), True) if depth is not None else (lf, False),
+            'bin': lambda lf: (bin_orderbook_polars(lf, binning), True) if binning is not None else (lf, False),
+            'tenor': lambda lf: (add_tenor_polars(lf, inst_type), True),
+            'log': lambda lf: (log_prices_polars(lf), True),
+            'exp': lambda lf: (exp_prices_polars(lf), True),
+        }
+        
         # Process features list in order
         trim_applied = False
         bin_applied = False
         feature_exprs = []
         
         for feat in features:
-            if feat == 'trim':
+            if feat in FLUSH_FEATURES:
+                # Flush accumulated expressions, then apply the transformation
                 lf, feature_exprs = _flush(lf, feature_exprs)
-                if depth is not None:
-                    lf = trim_orderbook_polars(lf, depth)
-                    trim_applied = True
-            elif feat == 'bin':
-                lf, feature_exprs = _flush(lf, feature_exprs)
-                if binning is not None:
-                    lf = bin_orderbook_polars(lf, binning)
-                    bin_applied = True
-            elif feat == 'tenor':
-                # Add expiry and T columns by parsing symbol
-                lf, feature_exprs = _flush(lf, feature_exprs)
-                lf = add_tenor_polars(lf, inst_type)
+                lf, was_applied = FLUSH_FEATURES[feat](lf)
+                
+                # Track trim/bin application for default fallback
+                if feat == 'trim':
+                    trim_applied = was_applied
+                elif feat == 'bin':
+                    bin_applied = was_applied
             elif isinstance(feat, str):
                 # Registry feature
                 if feat not in FEATURES:
-                    raise ValueError(f"Unknown feature '{feat}'. Available: {list(FEATURES.keys())}")
+                    available = list(FEATURES.keys()) + list(FLUSH_FEATURES.keys())
+                    raise ValueError(f"Unknown feature '{feat}'. Available: {available}")
                 feature_exprs.append(FEATURES[feat].alias(feat))
             elif callable(feat):
                 lf, feature_exprs = _flush(lf, feature_exprs)
                 lf = feat(lf)
             else:
-                raise ValueError(f"Feature must be string (registry name), 'trim', 'bin', or callable, got {type(feat)}")
+                raise ValueError(f"Feature must be string (registry name), callable, got {type(feat)}")
         
         # Final flush
         lf, feature_exprs = _flush(lf, feature_exprs)
@@ -236,59 +243,56 @@ class OrderbookStore:
                 variant=cache_name, path=str(path), rows=len(date_df)
             ))
     
-    def _get(self, inst_family: str, inst_type: str, dates: list[date],
-             builder: Callable[[list[date]], pl.LazyFrame],
-             cache_name: Optional[str] = None) -> pl.LazyFrame:
-        """Helper for get() and get_derived() to handle caching logic with optional batching."""
-        # Determine if we need batching
-        if self.batch_days is None or len(dates) <= self.batch_days:
-            # No batching needed - use original logic
-            if cache_name is None:
-                return builder(dates)
-            
-            # Check which dates need building
-            missing_dates = [d for d in dates 
-                            if not self.manifest.have(inst_family, inst_type, d, cache_name)]
-            
-            if missing_dates:
-                lf_missing = builder(missing_dates)
-                self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
-            
-            # Load from cache
-            paths = [str(self._path_for(inst_family, inst_type, d, cache_name)) 
-                     for d in dates if self.manifest.have(inst_family, inst_type, d, cache_name)]
-            return pl.scan_parquet(paths) if paths else pl.LazyFrame()
+    def _ensure_cached(self, inst_family: str, inst_type: str, dates: list[date],
+                       builder: Callable[[list[date]], pl.LazyFrame],
+                       cache_name: str) -> None:
+        """Build and cache missing dates."""
+        missing_dates = [d for d in dates 
+                        if not self.manifest.have(inst_family, inst_type, d, cache_name)]
         
-        # Batching enabled: split dates into batches
-        batch_size = self.batch_days
-        batches = [dates[i:i + batch_size] for i in range(0, len(dates), batch_size)]
-        
-        if cache_name is None:
-            # No caching: build each batch and concatenate
-            batch_results = []
-            for batch_dates in batches:
-                lf_batch = builder(batch_dates)
-                batch_results.append(lf_batch)
-            return pl.concat(batch_results) if batch_results else pl.LazyFrame()
-        
-        # With caching: process each batch, cache immediately, then load all
-        for batch_dates in batches:
-            missing_dates = [d for d in batch_dates 
-                            if not self.manifest.have(inst_family, inst_type, d, cache_name)]
-            if missing_dates:
-                lf_missing = builder(missing_dates)
-                self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
-        
-        # Load all requested dates from cache
+        if missing_dates:
+            lf_missing = builder(missing_dates)
+            self._write_cache(lf_missing, missing_dates, cache_name, inst_family, inst_type)
+    
+    def _load_from_cache(self, inst_family: str, inst_type: str, 
+                         dates: list[date], cache_name: str) -> pl.LazyFrame:
+        """Load requested dates from cache."""
         paths = [str(self._path_for(inst_family, inst_type, d, cache_name)) 
                  for d in dates if self.manifest.have(inst_family, inst_type, d, cache_name)]
         return pl.scan_parquet(paths) if paths else pl.LazyFrame()
+    
+    def _get(self, inst_family: str, inst_type: str, dates: list[date],
+             builder: Callable[[list[date]], pl.LazyFrame],
+             cache_name: Optional[str] = None,
+             verbose: bool = False) -> pl.LazyFrame:
+        """Helper for get() and get_derived() to handle caching logic with optional batching."""
+        needs_batching = self.batch_days is not None and len(dates) > self.batch_days
+        
+        if not needs_batching:
+            # Process all dates at once
+            self._ensure_cached(inst_family, inst_type, dates, builder, cache_name)
+            return self._load_from_cache(inst_family, inst_type, dates, cache_name) if cache_name else builder(dates)
+        
+        # Process dates in batches
+        batches = [dates[i:i + self.batch_days] for i in range(0, len(dates), self.batch_days)]
+        batch_iter = tqdm(batches, desc="Processing batches", disable=not verbose)
+        
+        if cache_name:
+            # Ensure all batches are cached, then load from cache
+            for batch_dates in batch_iter:
+                self._ensure_cached(inst_family, inst_type, batch_dates, builder, cache_name)
+            return self._load_from_cache(inst_family, inst_type, dates, cache_name)
+        else:
+            # Build batches directly and concatenate
+            batch_results = [builder(batch_dates) for batch_dates in batch_iter]
+            return pl.concat(batch_results) if batch_results else pl.LazyFrame()
     
     def get(self, inst_family: str, inst_type: str, 
             start: Optional[datetime] = None, end: Optional[datetime] = None,
             dates: Optional[list[date]] = None,
             depth: Optional[int] = None, binning: Optional[str] = None, 
-            features: Optional[list] = None, cache_name: Optional[str] = None) -> pl.LazyFrame:
+            features: Optional[list] = None, cache_name: Optional[str] = None,
+            verbose: bool = False) -> pl.LazyFrame:
         """
         Get orderbook data with optional transformations.
         
@@ -301,12 +305,13 @@ class OrderbookStore:
             self._scan_raw(inst_family, inst_type, dates_to_build), 
             inst_family, inst_type, depth, binning, features
         )
-        return self._get(inst_family, inst_type, dates, builder, cache_name)
+        return self._get(inst_family, inst_type, dates, builder, cache_name, verbose)
     
     def get_derived(self, recipe: Callable[[object, list[date]], pl.LazyFrame],
                     start: Optional[datetime] = None, end: Optional[datetime] = None,
                     dates: Optional[list[date]] = None,
-                    cache_name: Optional[str] = None) -> pl.LazyFrame:
+                    cache_name: Optional[str] = None,
+                    verbose: bool = False) -> pl.LazyFrame:
         """
         Get derived data via recipe function with signature (store, dates) -> LazyFrame.
         
@@ -315,7 +320,7 @@ class OrderbookStore:
         dates = self._date_range(start, end, dates)
         
         builder = lambda dates_to_build: recipe(self, dates_to_build)
-        return self._get('__derived__', '__derived__', dates, builder, cache_name)
+        return self._get('__derived__', '__derived__', dates, builder, cache_name, verbose)
     
     def delete_raw(self, inst_family: str, inst_type: str, date_obj: date):
         """Delete raw orderbook file and manifest entry for given family/type/date."""

@@ -14,12 +14,14 @@ Usage with functools.partial for configuration:
 import polars as pl
 import numpy as np
 from datetime import datetime, date, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 from forwards.pchip import fit_pchip_curve, ewma_smooth, curves_to_polars, PCHIPCurve
 from forwards.kalman_ns import kalman_filter, states_to_polars
-from forwards.utils import compute_weights
 
+# =============================================================================
+# Pillar preparation
+# =============================================================================
 
 def _drop_unneeded_columns(lf: pl.LazyFrame) -> pl.LazyFrame:
     """Drop columns not needed for forward curve fitting."""
@@ -61,18 +63,19 @@ def prepare_pillars(
     min_time_to_expiry_hours: float = 2.0,
     cache_name_suffix: str = "_pillars",
     unique_times: Optional[list[int]] = None,
-) -> dict[int, tuple[pl.DataFrame, pl.DataFrame]]:
+    drop_pillar_idx: Optional[int] = None,
+) -> dict[int, pl.DataFrame]:
     """
-    Prepare pillar data from SWAP and FUTURES orderbooks with timestamp matching.
+    Prepare concatenated pillar data from SWAP and FUTURES orderbooks.
     
-    Returns dict mapping timeMs -> (swap_row, futures_df) where each entry contains
-    the most recent swap snapshot and all valid futures contracts at that time.
+    Returns dict mapping timeMs -> pillars_df where each DataFrame contains
+    SWAP (at T=0) followed by FUTURES sorted by maturity. All data is in log-space.
     """
     # Build feature list (ordered for performance: trim early to reduce columns)
     features_base = ['trim', _drop_unneeded_columns]
     if binning:
         features_base.append('bin')
-    features_base.extend(['spread', 'rel_spread', 'tenor'])
+    features_base.extend(['spread', 'rel_spread', 'tenor', 'log'])  # Added 'log' feature
     if binning:
         features_base.append(_finalize_binning)
     
@@ -136,7 +139,7 @@ def prepare_pillars(
         
         # Get most recent swap snapshot at or before this time
         swap_matched = df_time.join_asof(df_swap_sorted, on='timeMs', strategy='backward')
-        if swap_matched.is_empty() or swap_matched['bid_1_px'][0] is None:
+        if swap_matched.is_empty() or swap_matched['ln_bid_1_px'][0] is None:
             continue
         
         # Get most recent snapshot for each futures symbol at or before this time
@@ -149,7 +152,7 @@ def prepare_pillars(
             # Filter where expiry > timeMs (not expired) and has valid data
             matched = matched.filter(
                 (pl.col('expiry') > pl.col('timeMs')) & 
-                (pl.col('bid_1_px').is_not_null())
+                (pl.col('ln_bid_1_px').is_not_null())
             )
             if not matched.is_empty():
                 futures_at_time.append(matched)
@@ -157,12 +160,46 @@ def prepare_pillars(
         if not futures_at_time:
             continue
         
-        # Concatenate all valid futures for this time
-        futures_df = pl.concat(futures_at_time)
-        snapshots[time] = (swap_matched, futures_df)
+        # Concatenate all valid futures for this time and sort by T
+        futures_df = pl.concat(futures_at_time).sort('T')
+        
+        # Concatenate swap (T=0) with futures to create full pillars DataFrame
+        pillars_df = pl.concat([swap_matched, futures_df]).sort('T')
+        
+        # Drop pillar if specified (for LOEO evaluation)
+        if drop_pillar_idx is not None:
+            if drop_pillar_idx < len(pillars_df):
+                # Drop the specified pillar by index
+                pillars_df = pl.concat([
+                    pillars_df[:drop_pillar_idx],
+                    pillars_df[drop_pillar_idx + 1:]
+                ])
+            else:
+                # Index out of range, skip this snapshot
+                continue
+        
+        snapshots[time] = pillars_df
     
     return snapshots
 
+# =============================================================================
+# Helper functions for forward recipes
+# =============================================================================
+
+def _extract_pillar_arrays(pillars_df: pl.DataFrame) -> dict:
+    """Extract arrays from concatenated pillars DataFrame (already sorted by T)."""
+    return {
+        'timeMs': int(pillars_df['timeMs'][0]),
+        'T': pillars_df['T'].to_numpy(),
+        'ln_F_bid': pillars_df['ln_bid_1_px'].to_numpy(),
+        'ln_F_ask': pillars_df['ln_ask_1_px'].to_numpy(),
+        'rel_spreads': pillars_df['rel_spread'].to_numpy(),
+        'symbols': pillars_df['symbol'].to_list(),
+    }
+
+# =============================================================================
+# Forward curve building recipes
+# =============================================================================
 
 def build_forwards_pchip(
     store,
@@ -170,10 +207,9 @@ def build_forwards_pchip(
     inst_family: str = 'BTC-USD',
     binning: Optional[str] = '5m',
     tau_ewma_minutes: float = 5.0,
-    w0_anchor: float = 10.0,
     min_time_to_expiry_hours: float = 2.0,
-    max_weight_ratio: float = 100.0,
     unique_times: Optional[list[int]] = None,
+    drop_pillar_idx: Optional[int] = None,
 ) -> pl.LazyFrame:
     """
     Build forward curve using PCHIP interpolation with time-aware EWMA smoothing.
@@ -190,6 +226,9 @@ def build_forwards_pchip(
         unique_times: Optional list of timeMs values to build curves for.
                      If None and binning is set, uses binned timestamps.
                      If None and no binning, uses union of all timestamps.
+        drop_pillar_idx: Optional pillar index to exclude (for LOEO evaluation).
+                        If provided, the pillar at this index in the sorted
+                        futures DataFrame will be dropped before fitting.
     """
     if not dates:
         return pl.LazyFrame()
@@ -198,7 +237,8 @@ def build_forwards_pchip(
     snapshots = prepare_pillars(
         store, inst_family, dates, binning, 
         min_time_to_expiry_hours=min_time_to_expiry_hours,
-        unique_times=unique_times
+        unique_times=unique_times,
+        drop_pillar_idx=drop_pillar_idx,
     )
     
     if not snapshots:
@@ -206,34 +246,17 @@ def build_forwards_pchip(
     
     curves = []
     
-    for timeMs, (swap, futures) in snapshots.items():
+    for timeMs, pillars_df in snapshots.items():
+        # Extract arrays from concatenated pillars
+        data = _extract_pillar_arrays(pillars_df)
         
-        # Extract swap anchor
-        F_bid_swap = swap['bid_1_px'][0]
-        F_ask_swap = swap['ask_1_px'][0]
-        
-        # Extract futures pillars
-        T_pillars = futures['T'].to_numpy()
-        F_bid_pillars = futures['bid_1_px'].to_numpy()
-        F_ask_pillars = futures['ask_1_px'].to_numpy()
-        symbols = futures['symbol'].to_list()
-        rel_spreads = futures['rel_spread'].to_numpy()
-        
-        # Compute weights
-        weights = compute_weights(rel_spreads, max_weight_ratio=max_weight_ratio)
-        
-        # Fit PCHIP curve
+        # Fit PCHIP curve (data already has log prices from prepare_pillars)
         curve = fit_pchip_curve(
-            T_pillars=T_pillars,
-            F_bid_pillars=F_bid_pillars,
-            F_ask_pillars=F_ask_pillars,
-            symbols=symbols,
+            T_pillars=data['T'],
+            F_bid_pillars=data['ln_F_bid'],
+            F_ask_pillars=data['ln_F_ask'],
+            symbols=data['symbols'],
             timeMs=int(timeMs),
-            T_swap=0.0,
-            F_bid_swap=F_bid_swap,
-            F_ask_swap=F_ask_swap,
-            w0_anchor=w0_anchor,
-            weights=weights,
         )
         curves.append(curve)
     
@@ -260,6 +283,7 @@ def build_forwards_kalman(
     min_time_to_expiry_hours: float = 2.0,
     kappa_spread: float = 0.5,
     unique_times: Optional[list[int]] = None,
+    drop_pillar_idx: Optional[int] = None,
 ) -> pl.LazyFrame:
     """
     Build forward curve using time-aware Kalman-filtered Nelson-Siegel carry model.
@@ -279,6 +303,9 @@ def build_forwards_kalman(
         unique_times: Optional list of timeMs values to build curves for.
                      If None and binning is set, uses binned timestamps.
                      If None and no binning, uses union of all timestamps.
+        drop_pillar_idx: Optional pillar index to exclude (for LOEO evaluation).
+                        If provided, the pillar at this index in the sorted
+                        futures DataFrame will be dropped before fitting.
     """
     if not dates:
         return pl.LazyFrame()
@@ -287,7 +314,8 @@ def build_forwards_kalman(
     snapshots_dict = prepare_pillars(
         store, inst_family, dates, binning,
         min_time_to_expiry_hours=min_time_to_expiry_hours,
-        unique_times=unique_times
+        unique_times=unique_times,
+        drop_pillar_idx=drop_pillar_idx,
     )
     
     if not snapshots_dict:
@@ -295,32 +323,24 @@ def build_forwards_kalman(
     
     snapshots = []
     
-    for timeMs, (swap, futures) in snapshots_dict.items():
+    for timeMs, pillars_df in snapshots_dict.items():
+        # Extract arrays from concatenated pillars
+        data = _extract_pillar_arrays(pillars_df)
         
-        # Extract swap reference
-        F_ref_bid = swap['bid_1_px'][0]
-        F_ref_ask = swap['ask_1_px'][0]
-        
-        # Extract futures pillars
-        T_pillars = futures['T'].to_numpy()
-        F_bid_pillars = futures['bid_1_px'].to_numpy()
-        F_ask_pillars = futures['ask_1_px'].to_numpy()
-        rel_spreads = futures['rel_spread'].to_numpy()
-        
-        snapshots.append({
-            'timeMs': int(timeMs),
-            'T_pillars': T_pillars,
-            'F_bid_pillars': F_bid_pillars,
-            'F_ask_pillars': F_ask_pillars,
-            'rel_spreads': rel_spreads,
-            'F_ref_bid': F_ref_bid,
-            'F_ref_ask': F_ref_ask,
-        })
+        # Create snapshot dict for kalman_filter
+        snapshot = {
+            'timeMs': data['timeMs'],
+            'T': data['T'],
+            'ln_F_bid': data['ln_F_bid'],
+            'ln_F_ask': data['ln_F_ask'],
+            'rel_spreads': data['rel_spreads'],
+        }
+        snapshots.append(snapshot)
     
     if not snapshots:
         return pl.LazyFrame()
     
-    # Apply time-aware Kalman filter
+    # Apply time-aware Kalman filter (now expects log prices)
     states = kalman_filter(
         snapshots=snapshots,
         lambda_ns=lambda_ns,

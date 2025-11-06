@@ -28,67 +28,64 @@ class NSCarryState:
         beta1: Slope factor (short-term carry deviation)
         beta2: Curvature factor (medium-term hump)
         lambda_ns: Shape parameter (fixed or estimated)
-        F_ref_bid: Reference forward for bid curve
-        F_ref_ask: Reference forward for ask curve
+        ln_F_ref_bid: Log reference forward for bid curve
+        ln_F_ref_ask: Log reference forward for ask curve
     """
     timeMs: int
     beta0: float
     beta1: float
     beta2: float
     lambda_ns: float
-    F_ref_bid: float
-    F_ref_ask: float
+    ln_F_ref_bid: float
+    ln_F_ref_ask: float
     
     @classmethod
-    def from_row(cls, row):
+    def from_polars(cls, df: pl.DataFrame):
         """
-        Create NSCarryState from a DataFrame row or dict-like object.
+        Create NSCarryState(s) from a Polars DataFrame.
         
         Args:
-            row: Polars DataFrame (single row), dict, or any object with item/attribute access
+            df: Polars DataFrame with columns: timeMs, beta0, beta1, beta2, lambda_ns, F_ref_bid, F_ref_ask
             
         Returns:
-            NSCarryState instance
+            - Single NSCarryState if df contains one row
+            - List[NSCarryState] if df contains multiple rows
             
         Examples:
-            >>> state = NSCarryState.from_row(df_kalman[0])
-            >>> state = NSCarryState.from_row(df_kalman.row(0, named=True))
+            >>> # Single state from filtered snapshot
+            >>> state = NSCarryState.from_polars(df.filter(pl.col('timeMs') == t))
+            
+            >>> # Multiple states from full dataset
+            >>> states = NSCarryState.from_polars(df_kalman)
         """
-        # Handle single-row DataFrame
-        if isinstance(row, pl.DataFrame):
-            if len(row) != 1:
-                raise ValueError(f"Expected single-row DataFrame, got {len(row)} rows")
+        if df.is_empty():
+            raise ValueError("Cannot create NSCarryState from empty DataFrame")
+        
+        if len(df) == 1:
+            # Single state
             return cls(
-                timeMs=int(row['timeMs'][0]),
-                beta0=float(row['beta0'][0]),
-                beta1=float(row['beta1'][0]),
-                beta2=float(row['beta2'][0]),
-                lambda_ns=float(row['lambda_ns'][0]),
-                F_ref_bid=float(row['F_ref_bid'][0]),
-                F_ref_ask=float(row['F_ref_ask'][0]),
+                timeMs=int(df['timeMs'][0]),
+                beta0=float(df['beta0'][0]),
+                beta1=float(df['beta1'][0]),
+                beta2=float(df['beta2'][0]),
+                lambda_ns=float(df['lambda_ns'][0]),
+                ln_F_ref_bid=float(df['ln_F_ref_bid'][0]),
+                ln_F_ref_ask=float(df['ln_F_ref_ask'][0]),
             )
-        # Handle dict-like or tuple row
-        elif hasattr(row, '__getitem__'):
-            return cls(
-                timeMs=int(row['timeMs']),
-                beta0=float(row['beta0']),
-                beta1=float(row['beta1']),
-                beta2=float(row['beta2']),
-                lambda_ns=float(row['lambda_ns']),
-                F_ref_bid=float(row['F_ref_bid']),
-                F_ref_ask=float(row['F_ref_ask']),
-            )
-        # Handle attribute access
         else:
-            return cls(
-                timeMs=int(row.timeMs),
-                beta0=float(row.beta0),
-                beta1=float(row.beta1),
-                beta2=float(row.beta2),
-                lambda_ns=float(row.lambda_ns),
-                F_ref_bid=float(row.F_ref_bid),
-                F_ref_ask=float(row.F_ref_ask),
-            )
+            # Multiple states
+            states = []
+            for i in range(len(df)):
+                states.append(cls(
+                    timeMs=int(df['timeMs'][i]),
+                    beta0=float(df['beta0'][i]),
+                    beta1=float(df['beta1'][i]),
+                    beta2=float(df['beta2'][i]),
+                    lambda_ns=float(df['lambda_ns'][i]),
+                    ln_F_ref_bid=float(df['ln_F_ref_bid'][i]),
+                    ln_F_ref_ask=float(df['ln_F_ref_ask'][i]),
+                ))
+            return states
     
     def to_polars(self) -> pl.DataFrame:
         """Convert to Polars DataFrame for storage."""
@@ -98,8 +95,8 @@ class NSCarryState:
             "beta1": [self.beta1],
             "beta2": [self.beta2],
             "lambda_ns": [self.lambda_ns],
-            "F_ref_bid": [self.F_ref_bid],
-            "F_ref_ask": [self.F_ref_ask],
+            "ln_F_ref_bid": [self.ln_F_ref_bid],
+            "ln_F_ref_ask": [self.ln_F_ref_ask],
         })
 
 
@@ -170,7 +167,7 @@ def reconstruct_ns_forward(
     Returns:
         Forward price(s) at target maturity
     """
-    F_ref = state.F_ref_bid if use_bid else state.F_ref_ask
+    ln_F_ref = state.ln_F_ref_bid if use_bid else state.ln_F_ref_ask
     
     integral = integrate_ns_carry(
         T_target,
@@ -180,7 +177,7 @@ def reconstruct_ns_forward(
         state.lambda_ns,
     )
     
-    return F_ref * np.exp(integral)
+    return np.exp(ln_F_ref + integral)
 
 
 class KalmanNSFilter:
@@ -365,12 +362,10 @@ def kalman_filter(
     Args:
         snapshots: List of dicts with keys:
             - 'timeMs': Timestamp in milliseconds
-            - 'T_pillars': Array of maturities
-            - 'F_bid_pillars': Bid prices
-            - 'F_ask_pillars': Ask prices
+            - 'T': Array of maturities (including T=0 for swap)
+            - 'ln_F_bid': Log bid prices
+            - 'ln_F_ask': Log ask prices
             - 'rel_spreads': Relative bid-ask spreads (for measurement noise)
-            - 'F_ref_bid': Reference bid (swap)
-            - 'F_ref_ask': Reference ask (swap)
         lambda_ns: Shape parameter (0.5-2.0/year typical for crypto)
         tau_minutes: Time constants [τ0, τ1, τ2] in minutes (default: [2d, 5d, 10d])
         sigma_per_sqrt_day: Volatilities [σ0, σ1, σ2] per sqrt(day) (default: [0.01, 0.01, 0.01])
@@ -388,30 +383,27 @@ def kalman_filter(
     
     for snap in snapshots:
         timeMs = snap['timeMs']
-        T_pillars = snap['T_pillars']
-        F_bid_pillars = snap['F_bid_pillars']
-        F_ask_pillars = snap['F_ask_pillars']
+        T_pillars = snap['T']
+        ln_F_bid_pillars = snap['ln_F_bid']
+        ln_F_ask_pillars = snap['ln_F_ask']
         rel_spreads = snap['rel_spreads']
-        F_ref_bid = snap['F_ref_bid']
-        F_ref_ask = snap['F_ref_ask']
+        
+        # Reference prices are at T=0 (first element)
+        ln_F_ref_bid = ln_F_bid_pillars[0]
+        ln_F_ref_ask = ln_F_ask_pillars[0]
         
         # Spread-based measurement noise in log-price space
-        # R_j = (κ · spread_j / F_mid_j)²
-        F_mid = (F_bid_pillars + F_ask_pillars) / 2
+        # R_j = (κ · spread_j)²  (already in relative terms)
         measurement_vars = (kappa_spread * rel_spreads) ** 2
         
         # Clip to [R_min, R_max] for numerical stability
         measurement_vars = np.clip(measurement_vars, R_min, R_max)
         
         # Filter bid curve
-        ln_F_bid_obs = np.log(F_bid_pillars)
-        ln_F_ref_bid = np.log(F_ref_bid)
-        theta_bid = filter_bid.update(timeMs, T_pillars, ln_F_bid_obs, ln_F_ref_bid, measurement_vars)
+        theta_bid = filter_bid.update(timeMs, T_pillars, ln_F_bid_pillars, ln_F_ref_bid, measurement_vars)
         
         # Filter ask curve (independent)
-        ln_F_ask_obs = np.log(F_ask_pillars)
-        ln_F_ref_ask = np.log(F_ref_ask)
-        theta_ask = filter_ask.update(timeMs, T_pillars, ln_F_ask_obs, ln_F_ref_ask, measurement_vars)
+        theta_ask = filter_ask.update(timeMs, T_pillars, ln_F_ask_pillars, ln_F_ref_ask, measurement_vars)
         
         # Average bid/ask factors for single curve representation
         beta0 = (theta_bid[0] + theta_ask[0]) / 2
@@ -424,8 +416,8 @@ def kalman_filter(
             beta1=beta1,
             beta2=beta2,
             lambda_ns=lambda_ns,
-            F_ref_bid=F_ref_bid,
-            F_ref_ask=F_ref_ask,
+            ln_F_ref_bid=ln_F_ref_bid,
+            ln_F_ref_ask=ln_F_ref_ask,
         )
         states.append(state)
     

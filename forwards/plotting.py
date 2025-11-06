@@ -317,8 +317,8 @@ def create_comparison_figure(
     snapshot_time = df_pchip['timeMs'].unique()[snapshot_idx]
     plot_pchip_snapshot(df_pchip, snapshot_time, ax=ax1)
     
-    # Kalman snapshot - use convenience constructor
-    state = NSCarryState.from_row(df_kalman[snapshot_idx])
+    # Kalman snapshot - extract single state
+    state = NSCarryState.from_polars(df_kalman[snapshot_idx:snapshot_idx+1])
     plot_kalman_snapshot(state, ax=ax2)
     
     # NS factors evolution

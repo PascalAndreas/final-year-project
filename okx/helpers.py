@@ -107,12 +107,36 @@ def bin_orderbook_polars(lf: pl.LazyFrame, freq: str) -> pl.LazyFrame:
         .sort(['symbol', 'timeMs'])
     )
 
+def log_prices_polars(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Transform _px columns to ln_px (log-space), dropping originals."""
+    schema = lf.collect_schema()
+    price_cols = [col for col in schema.names() if col.endswith('_px') or col in ['mid', 'spread']]
+    
+    if not price_cols:
+        return lf
+    
+    log_exprs = [pl.col(col).log().alias(f'ln_{col}') for col in price_cols]
+    return lf.with_columns(log_exprs).drop(price_cols)
+
+
+def exp_prices_polars(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Transform ln_px columns back to px (exp), dropping originals."""
+    schema = lf.collect_schema()
+    log_cols = [col for col in schema.names() if col.startswith('ln_')]
+    
+    if not log_cols:
+        return lf
+    
+    exp_exprs = [pl.col(col).exp().alias(col[3:]) for col in log_cols]
+    return lf.with_columns(exp_exprs).drop(log_cols)
+
+
 def add_tenor_polars(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
     """
     Add expiry (ms) and T (time to maturity in years) by parsing symbols.
     
     For FUTURES/OPTION: parses expiry from symbol
-    For SWAP: sets expiry to far future (T effectively 0)
+    For SWAP: sets expiry = timeMs (making T = 0)
     """
     df = lf.collect()
     if df.is_empty():
@@ -130,14 +154,15 @@ def add_tenor_polars(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
             return_dtype=pl.Int64
         )
     elif inst_type == 'SWAP':
-        expiry_ms = pl.lit(int(datetime(2099, 12, 31, 8, 0, 0, tzinfo=timezone.utc).timestamp() * 1000))
+        # Set expiry = timeMs so that T = 0 for perpetual swaps
+        expiry_ms = pl.col('timeMs')
     else:
         return df.lazy()
     
-    # Add expiry (ms) and T columns
+    # Add expiry (ms) and T columns. ACT/365F convention.
     return df.with_columns([
         expiry_ms.alias('expiry'),
-        ((expiry_ms - pl.col('timeMs')) / 1000.0 / (365.25 * 24 * 3600)).alias('T')
+        ((expiry_ms - pl.col('timeMs')) / 1000.0 / (365 * 24 * 3600)).alias('T')
     ]).lazy()
 
 # ===============================================================

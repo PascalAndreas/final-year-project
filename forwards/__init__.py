@@ -32,10 +32,6 @@ from .evaluation import (
     evaluate_curve_snapshot,
     EvaluationMetrics,
 )
-from .utils import (
-    datetime_to_year_fraction,
-    compute_weights,
-)
 from .plotting import (
     plot_pchip_snapshot,
     plot_kalman_snapshot,
@@ -69,9 +65,6 @@ __all__ = [
     "diagnostics",
     "evaluate_curve_snapshot",
     "EvaluationMetrics",
-    # Utils
-    "datetime_to_year_fraction",
-    "compute_weights",
     # Plotting
     "plot_pchip_snapshot",
     "plot_kalman_snapshot",

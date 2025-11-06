@@ -24,42 +24,61 @@ class PCHIPCurve:
         T_nodes: Array of time-to-maturity nodes (years)
         ln_F_bid_nodes: Log-forward bid values at nodes
         ln_F_ask_nodes: Log-forward ask values at nodes
-        symbols: Instrument symbols corresponding to nodes
-        source: Source type for each node ('swap', 'observed', 'interpolated')
+        symbols: Instrument symbols ('SWAP', 'BTC-USD-250905.OK', etc.)
     """
     timeMs: int
     T_nodes: np.ndarray
     ln_F_bid_nodes: np.ndarray
     ln_F_ask_nodes: np.ndarray
     symbols: list[str]
-    source: list[str]
     
     @classmethod
-    def from_dataframe(cls, df: pl.DataFrame):
+    def from_polars(cls, df: pl.DataFrame):
         """
-        Create PCHIPCurve from a DataFrame (typically a filtered snapshot).
+        Create PCHIPCurve(s) from a Polars DataFrame.
         
         Args:
             df: Polars DataFrame with columns: timeMs, T, ln_F_bid, ln_F_ask, symbol, source
             
         Returns:
-            PCHIPCurve instance
+            - Single PCHIPCurve if df contains one timeMs
+            - List[PCHIPCurve] if df contains multiple timeMs values
             
         Examples:
-            >>> snapshot_df = df_pchip.filter(pl.col('timeMs') == target_time)
-            >>> curve = PCHIPCurve.from_dataframe(snapshot_df)
+            >>> # Single curve from filtered snapshot
+            >>> curve = PCHIPCurve.from_polars(df.filter(pl.col('timeMs') == t))
+            
+            >>> # Multiple curves from full dataset
+            >>> curves = PCHIPCurve.from_polars(df_pchip)
         """
         if df.is_empty():
             raise ValueError("Cannot create PCHIPCurve from empty DataFrame")
         
-        return cls(
-            timeMs=int(df['timeMs'][0]),
-            T_nodes=df['T'].to_numpy(),
-            ln_F_bid_nodes=df['ln_F_bid'].to_numpy(),
-            ln_F_ask_nodes=df['ln_F_ask'].to_numpy(),
-            symbols=df['symbol'].to_list(),
-            source=df['source'].to_list(),
-        )
+        # Get unique timestamps
+        unique_times = df['timeMs'].unique().sort().to_list()
+        
+        if len(unique_times) == 1:
+            # Single curve
+            return cls(
+                timeMs=int(df['timeMs'][0]),
+                T_nodes=df['T'].to_numpy(),
+                ln_F_bid_nodes=df['ln_F_bid'].to_numpy(),
+                ln_F_ask_nodes=df['ln_F_ask'].to_numpy(),
+                symbols=df['symbol'].to_list(),
+            )
+        else:
+            # Multiple curves
+            curves = []
+            for t in unique_times:
+                df_t = df.filter(pl.col('timeMs') == t)
+                curves.append(cls(
+                    timeMs=int(t),
+                    T_nodes=df_t['T'].to_numpy(),
+                    ln_F_bid_nodes=df_t['ln_F_bid'].to_numpy(),
+                    ln_F_ask_nodes=df_t['ln_F_ask'].to_numpy(),
+                    symbols=df_t['symbol'].to_list(),
+                ))
+            return curves
     
     def to_polars(self) -> pl.DataFrame:
         """Convert to Polars DataFrame for storage."""
@@ -71,7 +90,6 @@ class PCHIPCurve:
             "F_bid": np.exp(self.ln_F_bid_nodes),
             "F_ask": np.exp(self.ln_F_ask_nodes),
             "symbol": self.symbols,
-            "source": self.source,
         })
 
 
@@ -81,83 +99,28 @@ def fit_pchip_curve(
     F_ask_pillars: np.ndarray,
     symbols: list[str],
     timeMs: int,
-    T_swap: float = 0.0,
-    F_bid_swap: Optional[float] = None,
-    F_ask_swap: Optional[float] = None,
-    w0_anchor: float = 10.0,
-    weights: Optional[np.ndarray] = None,
 ) -> PCHIPCurve:
     """
-    Fit PCHIP curve on log-forwards with soft swap anchor.
+    Fit PCHIP curve on log-forwards.
     
-    Uses weighted least-squares to add a soft constraint at T=0, then fits
-    PCHIP interpolator on the resulting node values.
+    Expects sorted, concatenated data (swap + futures) with LOG PRICES.
+    Use concat_swap_and_pillars() to prepare data.
     
     Args:
-        T_pillars: Time-to-maturity for futures contracts (years)
-        F_bid_pillars: Bid prices for futures
-        F_ask_pillars: Ask prices for futures
-        symbols: Instrument symbols for each pillar
+        T_pillars: Time-to-maturity (sorted, T=0 at start)
+        F_bid_pillars: Log bid prices (ln F)
+        F_ask_pillars: Log ask prices (ln F)
+        symbols: Instrument symbols (['SWAP', 'BTC-USD-250905.OK', ...])
         timeMs: Timestamp in milliseconds
-        T_swap: Time-to-maturity for swap (typically 0.0 for perpetual)
-        F_bid_swap: Swap bid price (if None, no anchor)
-        F_ask_swap: Swap ask price (if None, no anchor)
-        w0_anchor: Weight for swap anchor constraint (higher = stronger anchor)
-        weights: Optional weights for each pillar (default: equal weights)
         
     Returns:
         PCHIPCurve with fitted nodes
-        
-    Notes:
-        - PCHIP guarantees monotonicity if data is monotonic
-        - Soft anchoring prevents unrealistic spot-futures divergence
-        - Works in log-space to ensure positive forwards
     """
-    # Prepare arrays
-    if weights is None:
-        weights = np.ones(len(T_pillars))
-    
-    # Normalize weights
-    weights = weights / weights.sum()
-    
-    # Add swap anchor if provided
-    if F_bid_swap is not None and F_ask_swap is not None:
-        T_all = np.concatenate([[T_swap], T_pillars])
-        F_bid_all = np.concatenate([[F_bid_swap], F_bid_pillars])
-        F_ask_all = np.concatenate([[F_ask_swap], F_ask_pillars])
-        symbols_all = ["SWAP"] + list(symbols)
-        source_all = ["swap"] + ["observed"] * len(T_pillars)
-        
-        # Scale anchor weight relative to pillar weights
-        anchor_weight = w0_anchor / len(T_pillars)
-        weights_all = np.concatenate([[anchor_weight], weights * (1 - anchor_weight)])
-    else:
-        T_all = T_pillars
-        F_bid_all = F_bid_pillars
-        F_ask_all = F_ask_pillars
-        symbols_all = list(symbols)
-        source_all = ["observed"] * len(T_pillars)
-        weights_all = weights
-    
-    # Sort by T (PCHIP requires sorted x)
-    sort_idx = np.argsort(T_all)
-    T_sorted = T_all[sort_idx]
-    F_bid_sorted = F_bid_all[sort_idx]
-    F_ask_sorted = F_ask_all[sort_idx]
-    symbols_sorted = [symbols_all[i] for i in sort_idx]
-    source_sorted = [source_all[i] for i in sort_idx]
-    
-    # Work in log space
-    ln_F_bid = np.log(F_bid_sorted)
-    ln_F_ask = np.log(F_ask_sorted)
-    
     # Remove any duplicates in T (keep first occurrence)
-    unique_T, unique_idx = np.unique(T_sorted, return_index=True)
-    T_nodes = unique_T
-    ln_F_bid_nodes = ln_F_bid[unique_idx]
-    ln_F_ask_nodes = ln_F_ask[unique_idx]
-    symbols_nodes = [symbols_sorted[i] for i in unique_idx]
-    source_nodes = [source_sorted[i] for i in unique_idx]
+    T_nodes, unique_idx = np.unique(T_pillars, return_index=True)
+    ln_F_bid_nodes = F_bid_pillars[unique_idx]
+    ln_F_ask_nodes = F_ask_pillars[unique_idx]
+    symbols_nodes = [symbols[i] for i in unique_idx]
     
     return PCHIPCurve(
         timeMs=timeMs,
@@ -165,7 +128,6 @@ def fit_pchip_curve(
         ln_F_bid_nodes=ln_F_bid_nodes,
         ln_F_ask_nodes=ln_F_ask_nodes,
         symbols=symbols_nodes,
-        source=source_nodes,
     )
 
 
@@ -275,7 +237,6 @@ class EWMAState:
             ln_F_bid_nodes=np.array(smoothed_ln_bid),
             ln_F_ask_nodes=np.array(smoothed_ln_ask),
             symbols=curve.symbols,
-            source=curve.source,
         )
     
     def reset(self):

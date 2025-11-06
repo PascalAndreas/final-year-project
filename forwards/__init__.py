@@ -36,6 +36,15 @@ from .utils import (
     datetime_to_year_fraction,
     compute_weights,
 )
+from .plotting import (
+    plot_pchip_snapshot,
+    plot_kalman_snapshot,
+    plot_ns_factors,
+    plot_forward_tracking,
+    plot_error_distribution,
+    plot_spread_analysis,
+    create_comparison_figure,
+)
 
 __all__ = [
     # PCHIP
@@ -63,5 +72,13 @@ __all__ = [
     # Utils
     "datetime_to_year_fraction",
     "compute_weights",
+    # Plotting
+    "plot_pchip_snapshot",
+    "plot_kalman_snapshot",
+    "plot_ns_factors",
+    "plot_forward_tracking",
+    "plot_error_distribution",
+    "plot_spread_analysis",
+    "create_comparison_figure",
 ]
 

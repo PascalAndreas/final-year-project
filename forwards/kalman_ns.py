@@ -39,6 +39,57 @@ class NSCarryState:
     F_ref_bid: float
     F_ref_ask: float
     
+    @classmethod
+    def from_row(cls, row):
+        """
+        Create NSCarryState from a DataFrame row or dict-like object.
+        
+        Args:
+            row: Polars DataFrame (single row), dict, or any object with item/attribute access
+            
+        Returns:
+            NSCarryState instance
+            
+        Examples:
+            >>> state = NSCarryState.from_row(df_kalman[0])
+            >>> state = NSCarryState.from_row(df_kalman.row(0, named=True))
+        """
+        # Handle single-row DataFrame
+        if isinstance(row, pl.DataFrame):
+            if len(row) != 1:
+                raise ValueError(f"Expected single-row DataFrame, got {len(row)} rows")
+            return cls(
+                timeMs=int(row['timeMs'][0]),
+                beta0=float(row['beta0'][0]),
+                beta1=float(row['beta1'][0]),
+                beta2=float(row['beta2'][0]),
+                lambda_ns=float(row['lambda_ns'][0]),
+                F_ref_bid=float(row['F_ref_bid'][0]),
+                F_ref_ask=float(row['F_ref_ask'][0]),
+            )
+        # Handle dict-like or tuple row
+        elif hasattr(row, '__getitem__'):
+            return cls(
+                timeMs=int(row['timeMs']),
+                beta0=float(row['beta0']),
+                beta1=float(row['beta1']),
+                beta2=float(row['beta2']),
+                lambda_ns=float(row['lambda_ns']),
+                F_ref_bid=float(row['F_ref_bid']),
+                F_ref_ask=float(row['F_ref_ask']),
+            )
+        # Handle attribute access
+        else:
+            return cls(
+                timeMs=int(row.timeMs),
+                beta0=float(row.beta0),
+                beta1=float(row.beta1),
+                beta2=float(row.beta2),
+                lambda_ns=float(row.lambda_ns),
+                F_ref_bid=float(row.F_ref_bid),
+                F_ref_ask=float(row.F_ref_ask),
+            )
+    
     def to_polars(self) -> pl.DataFrame:
         """Convert to Polars DataFrame for storage."""
         return pl.DataFrame({
@@ -134,44 +185,59 @@ def reconstruct_ns_forward(
 
 class KalmanNSFilter:
     """
-    Kalman filter for Nelson-Siegel carry curve estimation.
+    Time-aware Kalman filter for Nelson-Siegel carry curve estimation.
+    
+    Models carry factors as independent Ornstein-Uhlenbeck processes:
+        dβ_k = -(1/τ_k)·β_k·dt + σ_k·dW_k
+    
+    Uses exact OU discretization for frame-rate invariance:
+        A_k = exp(-Δt/τ_k)
+        Q_k = (σ_k²·τ_k/2)·(1 - exp(-2Δt/τ_k))
     
     State: θ = [β0, β1, β2]
-    Transition: θ_t = A·θ_{t-1} + η_t, η_t ~ N(0, Q)
-    Observation: y_i = H_i·θ + ε_i, ε_i ~ N(0, R_i)
-    
-    where y_i = ln F_i - ln F_ref is the log-forward relative to reference.
+    Observation: y_i = H_i·θ + ε_i, where y_i = ln F_i - ln F_ref
     """
     
     def __init__(
         self,
-        lambda_ns: float = 0.1,
-        process_noise_scale: float = 1e-4,
-        ar1_coef: float = 0.99,
+        lambda_ns: float = 1.0,
+        tau_minutes: np.ndarray = None,
+        sigma_per_sqrt_day: np.ndarray = None,
     ):
         """
-        Initialize Kalman filter for NS carry estimation.
+        Initialize time-aware Kalman filter for NS carry estimation.
         
         Args:
-            lambda_ns: Shape parameter (fixed, typically 0.05-0.2)
-            process_noise_scale: Scale for process noise covariance Q
-            ar1_coef: AR(1) coefficient for state transition (close to 1 for persistence)
+            lambda_ns: Shape parameter (fixed, typically 0.5-2.0/year for crypto)
+            tau_minutes: Time constants [τ0, τ1, τ2] in minutes for each factor
+                        Default: [2880, 7200, 14400] (2d, 5d, 10d)
+                        Higher = more persistent
+            sigma_per_sqrt_day: Volatility [σ0, σ1, σ2] per sqrt(day) for each factor
+                               Default: [0.01, 0.01, 0.01]
+                               Controls innovation size
         """
         self.lambda_ns = lambda_ns
-        self.process_noise_scale = process_noise_scale
-        
-        # State dimension
         self.n_states = 3
         
-        # State transition matrix (AR(1) per factor)
-        self.A = np.eye(3) * ar1_coef
+        # Default time constants: front factor faster, back factor slower
+        if tau_minutes is None:
+            tau_minutes = np.array([2880.0, 7200.0, 14400.0])  # 2d, 5d, 10d
+        self.tau_seconds = tau_minutes * 60.0  # Convert to seconds
         
-        # Process noise covariance
-        self.Q = np.eye(3) * process_noise_scale
+        # Default volatilities
+        if sigma_per_sqrt_day is None:
+            sigma_per_sqrt_day = np.array([0.01, 0.01, 0.01])
+        self.sigma = sigma_per_sqrt_day / np.sqrt(86400.0)  # Convert to per sqrt(second)
         
-        # Initial state
-        self.x = np.array([0.0, 0.0, 0.0])  # Start with zero carry
-        self.P = np.eye(3) * 0.01  # Initial covariance
+        # Initial state: zero carry
+        self.x = np.array([0.0, 0.0, 0.0])
+        
+        # Initial covariance: stationary covariance of OU process
+        # P_stationary = σ_k²·τ_k / 2
+        self.P = np.diag(self.sigma ** 2 * self.tau_seconds / 2)
+        
+        # Track last update time for Δt computation
+        self.last_update_time = None
     
     def _build_observation_matrix(self, T_pillars: np.ndarray) -> np.ndarray:
         """
@@ -200,15 +266,21 @@ class KalmanNSFilter:
     
     def update(
         self,
+        timeMs: int,
         T_pillars: np.ndarray,
         ln_F_obs: np.ndarray,
         ln_F_ref: float,
         measurement_variances: np.ndarray,
     ) -> np.ndarray:
         """
-        Kalman filter update step.
+        Time-aware Kalman filter update step.
+        
+        Discretizes OU dynamics based on actual Δt:
+            A_k = exp(-Δt/τ_k)
+            Q_k = (σ_k²·τ_k/2)·(1 - exp(-2Δt/τ_k))
         
         Args:
+            timeMs: Current timestamp in milliseconds
             T_pillars: Time-to-maturity for observed contracts
             ln_F_obs: Log-forward prices (observed)
             ln_F_ref: Log-reference price (typically perpetual swap)
@@ -217,9 +289,31 @@ class KalmanNSFilter:
         Returns:
             Updated state estimate θ = [β0, β1, β2]
         """
+        # Compute time step for OU discretization
+        if self.last_update_time is None:
+            dt = 0.0  # First update: no prediction step
+        else:
+            dt = (timeMs - self.last_update_time) / 1000.0  # seconds
+        
+        self.last_update_time = timeMs
+        
+        # Exact OU discretization for each factor
+        if dt > 0:
+            # A_k = exp(-Δt/τ_k)
+            A_diag = np.exp(-dt / self.tau_seconds)
+            A = np.diag(A_diag)
+            
+            # Q_k = (σ_k²·τ_k/2)·(1 - exp(-2Δt/τ_k))
+            Q_diag = (self.sigma ** 2 * self.tau_seconds / 2) * (1 - np.exp(-2 * dt / self.tau_seconds))
+            Q = np.diag(Q_diag)
+        else:
+            # No time passed: identity transition, zero noise
+            A = np.eye(self.n_states)
+            Q = np.zeros((self.n_states, self.n_states))
+        
         # Predict
-        x_pred = self.A @ self.x
-        P_pred = self.A @ self.P @ self.A.T + self.Q
+        x_pred = A @ self.x
+        P_pred = A @ self.P @ A.T + Q
         
         # Build observation model
         H = self._build_observation_matrix(T_pillars)
@@ -249,38 +343,46 @@ class KalmanNSFilter:
     def reset(self):
         """Reset filter to initial state."""
         self.x = np.array([0.0, 0.0, 0.0])
-        self.P = np.eye(3) * 0.01
+        self.P = np.diag(self.sigma ** 2 * self.tau_seconds / 2)  # Stationary covariance
+        self.last_update_time = None
 
 
 def kalman_filter(
     snapshots: list[dict],
-    lambda_ns: float = 0.1,
-    process_noise_scale: float = 1e-4,
-    ar1_coef: float = 0.99,
-    spread_to_variance_scale: float = 1.0,
+    lambda_ns: float = 1.0,
+    tau_minutes: np.ndarray = None,
+    sigma_per_sqrt_day: np.ndarray = None,
+    kappa_spread: float = 0.5,
+    R_min: float = 1e-8,
+    R_max: float = 1e-2,
 ) -> list[NSCarryState]:
     """
-    Apply Kalman filter to sequence of orderbook snapshots.
+    Apply time-aware Kalman filter to sequence of orderbook snapshots.
+    
+    Uses exact OU discretization and spread-based measurement noise for
+    frame-rate invariance and adaptive noise handling.
     
     Args:
         snapshots: List of dicts with keys:
-            - 'timeMs': Timestamp
+            - 'timeMs': Timestamp in milliseconds
             - 'T_pillars': Array of maturities
             - 'F_bid_pillars': Bid prices
             - 'F_ask_pillars': Ask prices
             - 'rel_spreads': Relative bid-ask spreads (for measurement noise)
             - 'F_ref_bid': Reference bid (swap)
             - 'F_ref_ask': Reference ask (swap)
-        lambda_ns: Shape parameter
-        process_noise_scale: Process noise scale
-        ar1_coef: AR(1) coefficient
-        spread_to_variance_scale: Scale to convert relative spread to measurement variance
+        lambda_ns: Shape parameter (0.5-2.0/year typical for crypto)
+        tau_minutes: Time constants [τ0, τ1, τ2] in minutes (default: [2d, 5d, 10d])
+        sigma_per_sqrt_day: Volatilities [σ0, σ1, σ2] per sqrt(day) (default: [0.01, 0.01, 0.01])
+        kappa_spread: Scale factor for spread-based measurement noise (0.5-1.0 typical)
+        R_min: Minimum measurement variance (floor to avoid singularity)
+        R_max: Maximum measurement variance (cap for very wide spreads)
         
     Returns:
-        List of NSCarryState objects
+        List of NSCarryState objects with time-aware filtering
     """
-    filter_bid = KalmanNSFilter(lambda_ns, process_noise_scale, ar1_coef)
-    filter_ask = KalmanNSFilter(lambda_ns, process_noise_scale, ar1_coef)
+    filter_bid = KalmanNSFilter(lambda_ns, tau_minutes, sigma_per_sqrt_day)
+    filter_ask = KalmanNSFilter(lambda_ns, tau_minutes, sigma_per_sqrt_day)
     
     states = []
     
@@ -293,23 +395,25 @@ def kalman_filter(
         F_ref_bid = snap['F_ref_bid']
         F_ref_ask = snap['F_ref_ask']
         
-        # Measurement noise from relative spreads (wider spread = more uncertain)
-        # Variance in log-price space: rel_spread^2
-        measurement_vars = (rel_spreads ** 2) * spread_to_variance_scale
-        measurement_vars = np.maximum(measurement_vars, 1e-8)  # Floor to avoid numerical issues
+        # Spread-based measurement noise in log-price space
+        # R_j = (κ · spread_j / F_mid_j)²
+        F_mid = (F_bid_pillars + F_ask_pillars) / 2
+        measurement_vars = (kappa_spread * rel_spreads) ** 2
+        
+        # Clip to [R_min, R_max] for numerical stability
+        measurement_vars = np.clip(measurement_vars, R_min, R_max)
         
         # Filter bid curve
         ln_F_bid_obs = np.log(F_bid_pillars)
         ln_F_ref_bid = np.log(F_ref_bid)
-        theta_bid = filter_bid.update(T_pillars, ln_F_bid_obs, ln_F_ref_bid, measurement_vars)
+        theta_bid = filter_bid.update(timeMs, T_pillars, ln_F_bid_obs, ln_F_ref_bid, measurement_vars)
         
         # Filter ask curve (independent)
         ln_F_ask_obs = np.log(F_ask_pillars)
         ln_F_ref_ask = np.log(F_ref_ask)
-        theta_ask = filter_ask.update(T_pillars, ln_F_ask_obs, ln_F_ref_ask, measurement_vars)
+        theta_ask = filter_ask.update(timeMs, T_pillars, ln_F_ask_obs, ln_F_ref_ask, measurement_vars)
         
-        # Average the parameters (or store separately)
-        # For simplicity, we'll average bid/ask factors
+        # Average bid/ask factors for single curve representation
         beta0 = (theta_bid[0] + theta_ask[0]) / 2
         beta1 = (theta_bid[1] + theta_ask[1]) / 2
         beta2 = (theta_bid[2] + theta_ask[2]) / 2

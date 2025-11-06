@@ -169,20 +169,24 @@ def build_forwards_pchip(
     dates: list[date],
     inst_family: str = 'BTC-USD',
     binning: Optional[str] = '5m',
-    lambda_ewma: float = 0.8,
+    tau_ewma_minutes: float = 5.0,
     w0_anchor: float = 10.0,
     min_time_to_expiry_hours: float = 2.0,
     max_weight_ratio: float = 100.0,
     unique_times: Optional[list[int]] = None,
 ) -> pl.LazyFrame:
     """
-    Build forward curve using PCHIP interpolation with EWMA smoothing.
+    Build forward curve using PCHIP interpolation with time-aware EWMA smoothing.
+    
+    Uses α(Δt) = exp(-Δt/τ) for frame-rate invariance across binning intervals.
     
     Recipe for store.get_derived(). Use functools.partial to configure:
-        recipe = partial(build_forwards_pchip, binning='1m', lambda_ewma=0.9)
+        recipe = partial(build_forwards_pchip, binning='1m', tau_ewma_minutes=5.0)
         lf = store.get_derived(recipe, start, end, cache_name='forwards_pchip_1m')
     
     Args:
+        tau_ewma_minutes: Time constant in minutes (typical: 3-10 for crypto)
+                         Half-life = tau * ln(2) ≈ 0.693 * tau
         unique_times: Optional list of timeMs values to build curves for.
                      If None and binning is set, uses binned timestamps.
                      If None and no binning, uses union of all timestamps.
@@ -236,8 +240,8 @@ def build_forwards_pchip(
     if not curves:
         return pl.LazyFrame()
     
-    # Apply EWMA smoothing
-    smoothed_curves = ewma_smooth(curves, lambda_ewma=lambda_ewma)
+    # Apply time-aware EWMA smoothing
+    smoothed_curves = ewma_smooth(curves, tau_minutes=tau_ewma_minutes)
     
     # Convert to Polars
     df_result = curves_to_polars(smoothed_curves)
@@ -250,21 +254,28 @@ def build_forwards_kalman(
     dates: list[date],
     inst_family: str = 'BTC-USD',
     binning: Optional[str] = '1m',
-    lambda_ns: float = 0.1,
-    process_noise_scale: float = 1e-4,
-    ar1_coef: float = 0.99,
+    lambda_ns: float = 1.0,
+    tau_minutes: np.ndarray = None,
+    sigma_per_sqrt_day: np.ndarray = None,
     min_time_to_expiry_hours: float = 2.0,
-    spread_to_variance_scale: float = 1.0,
+    kappa_spread: float = 0.5,
     unique_times: Optional[list[int]] = None,
 ) -> pl.LazyFrame:
     """
-    Build forward curve using Kalman-filtered Nelson-Siegel carry model.
+    Build forward curve using time-aware Kalman-filtered Nelson-Siegel carry model.
+    
+    Uses exact OU discretization for frame-rate invariance and spread-based
+    measurement noise for adaptive filtering.
     
     Recipe for store.get_derived(). Use functools.partial to configure:
-        recipe = partial(build_forwards_kalman, binning='5m', lambda_ns=0.05)
+        recipe = partial(build_forwards_kalman, binning='5m', lambda_ns=1.0)
         lf = store.get_derived(recipe, start, end, cache_name='forwards_kalman_5m')
     
     Args:
+        lambda_ns: Shape parameter (0.5-2.0/year typical for crypto)
+        tau_minutes: Time constants [τ0, τ1, τ2] in minutes (default: [2d, 5d, 10d])
+        sigma_per_sqrt_day: Volatilities [σ0, σ1, σ2] per sqrt(day) (default: [0.01, 0.01, 0.01])
+        kappa_spread: Scale factor for spread-based measurement noise (0.5-1.0 typical)
         unique_times: Optional list of timeMs values to build curves for.
                      If None and binning is set, uses binned timestamps.
                      If None and no binning, uses union of all timestamps.
@@ -309,13 +320,13 @@ def build_forwards_kalman(
     if not snapshots:
         return pl.LazyFrame()
     
-    # Apply Kalman filter
+    # Apply time-aware Kalman filter
     states = kalman_filter(
         snapshots=snapshots,
         lambda_ns=lambda_ns,
-        process_noise_scale=process_noise_scale,
-        ar1_coef=ar1_coef,
-        spread_to_variance_scale=spread_to_variance_scale,
+        tau_minutes=tau_minutes,
+        sigma_per_sqrt_day=sigma_per_sqrt_day,
+        kappa_spread=kappa_spread,
     )
     
     # Convert to Polars

@@ -34,6 +34,33 @@ class PCHIPCurve:
     symbols: list[str]
     source: list[str]
     
+    @classmethod
+    def from_dataframe(cls, df: pl.DataFrame):
+        """
+        Create PCHIPCurve from a DataFrame (typically a filtered snapshot).
+        
+        Args:
+            df: Polars DataFrame with columns: timeMs, T, ln_F_bid, ln_F_ask, symbol, source
+            
+        Returns:
+            PCHIPCurve instance
+            
+        Examples:
+            >>> snapshot_df = df_pchip.filter(pl.col('timeMs') == target_time)
+            >>> curve = PCHIPCurve.from_dataframe(snapshot_df)
+        """
+        if df.is_empty():
+            raise ValueError("Cannot create PCHIPCurve from empty DataFrame")
+        
+        return cls(
+            timeMs=int(df['timeMs'][0]),
+            T_nodes=df['T'].to_numpy(),
+            ln_F_bid_nodes=df['ln_F_bid'].to_numpy(),
+            ln_F_ask_nodes=df['ln_F_ask'].to_numpy(),
+            symbols=df['symbol'].to_list(),
+            source=df['source'].to_list(),
+        )
+    
     def to_polars(self) -> pl.DataFrame:
         """Convert to Polars DataFrame for storage."""
         return pl.DataFrame({
@@ -176,25 +203,36 @@ def reconstruct_forward(
 
 class EWMAState:
     """
-    State container for EWMA smoothing of pillar values over time.
+    Time-aware EWMA smoothing of pillar log-forwards.
+    
+    Uses continuous-time parameterization: α(Δt) = exp(-Δt/τ)
+    This ensures frame-rate invariance across 1m, 5m, irregular binning.
     
     Tracks smoothed log-forward values for each (symbol, T) combination.
     """
     
-    def __init__(self, lambda_ewma: float = 0.8):
+    def __init__(self, tau_minutes: float = 5.0):
         """
-        Initialize EWMA state.
+        Initialize time-aware EWMA state.
         
         Args:
-            lambda_ewma: Smoothing parameter (0.7-0.9 typical)
-                        Higher = smoother but more lag
+            tau_minutes: Time constant in minutes (higher = smoother, more lag)
+                        Typical values: 3-10 minutes for crypto
+                        Half-life = tau * ln(2) ≈ 0.693 * tau
         """
-        self.lambda_ewma = lambda_ewma
-        self.state: Dict[str, Tuple[float, float, float]] = {}  # symbol -> (T, ln_F_bid, ln_F_ask)
+        self.tau_seconds = tau_minutes * 60.0  # Convert to seconds for precision
+        self.state: Dict[str, Tuple[int, float, float, float]] = {}  
+        # symbol -> (last_timeMs, T, ln_F_bid, ln_F_ask)
     
     def update(self, curve: PCHIPCurve) -> PCHIPCurve:
         """
-        Update EWMA state and return smoothed curve.
+        Update EWMA state with time-aware smoothing.
+        
+        For each pillar:
+            α = exp(-Δt/τ)
+            ŷ_smooth = α * ŷ_prev + (1-α) * y_obs
+        
+        This is frame-rate invariant: same behavior at 1m, 5m, or irregular times.
         
         Args:
             curve: New observed curve
@@ -211,16 +249,23 @@ class EWMAState:
             ln_ask_obs = curve.ln_F_ask_nodes[i]
             
             if symbol in self.state:
-                # EWMA update
-                T_prev, ln_bid_prev, ln_ask_prev = self.state[symbol]
-                ln_bid_smooth = self.lambda_ewma * ln_bid_prev + (1 - self.lambda_ewma) * ln_bid_obs
-                ln_ask_smooth = self.lambda_ewma * ln_ask_prev + (1 - self.lambda_ewma) * ln_ask_obs
+                # Compute actual elapsed time
+                last_timeMs, T_prev, ln_bid_prev, ln_ask_prev = self.state[symbol]
+                dt_seconds = (curve.timeMs - last_timeMs) / 1000.0
+                
+                # Time-aware EWMA weight: α = exp(-Δt/τ)
+                alpha = np.exp(-dt_seconds / self.tau_seconds)
+                
+                # Smooth
+                ln_bid_smooth = alpha * ln_bid_prev + (1 - alpha) * ln_bid_obs
+                ln_ask_smooth = alpha * ln_ask_prev + (1 - alpha) * ln_ask_obs
             else:
                 # Initialize with observation
                 ln_bid_smooth = ln_bid_obs
                 ln_ask_smooth = ln_ask_obs
             
-            self.state[symbol] = (T, ln_bid_smooth, ln_ask_smooth)
+            # Update state with timestamp
+            self.state[symbol] = (curve.timeMs, T, ln_bid_smooth, ln_ask_smooth)
             smoothed_ln_bid.append(ln_bid_smooth)
             smoothed_ln_ask.append(ln_ask_smooth)
         
@@ -240,23 +285,26 @@ class EWMAState:
 
 def ewma_smooth(
     curves: list[PCHIPCurve],
-    lambda_ewma: float = 0.8,
+    tau_minutes: float = 5.0,
 ) -> list[PCHIPCurve]:
     """
-    Apply EWMA smoothing to sequence of curves.
+    Apply time-aware EWMA smoothing to sequence of curves.
+    
+    Uses α(Δt) = exp(-Δt/τ) for frame-rate invariance.
     
     Args:
         curves: List of PCHIPCurve objects sorted by time
-        lambda_ewma: Smoothing parameter (0.7-0.9 typical)
+        tau_minutes: Time constant in minutes (typical: 3-10 for crypto)
+                    Half-life = tau * ln(2) ≈ 0.693 * tau
         
     Returns:
         List of smoothed curves
         
     Examples:
         >>> curves = [fit_pchip_curve(...) for snapshot in snapshots]
-        >>> smoothed = ewma_smooth(curves, lambda_ewma=0.8)
+        >>> smoothed = ewma_smooth(curves, tau_minutes=5.0)
     """
-    state = EWMAState(lambda_ewma=lambda_ewma)
+    state = EWMAState(tau_minutes=tau_minutes)
     smoothed_curves = []
     
     for curve in curves:

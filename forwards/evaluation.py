@@ -402,3 +402,176 @@ def evaluate_curve_snapshot(
     
     return pl.concat(metrics)
 
+
+def loeo_error(
+    store,
+    dates: list,
+    forwards_recipe: Callable,
+    recipe_kwargs: Optional[dict] = None,
+) -> pl.DataFrame:
+    """
+    Compute leave-one-expiry-out cross-validation error for forward curves.
+    
+    For each pillar at each timestamp:
+        1. Rebuild curve with that pillar excluded (using drop_pillar_idx)
+        2. Predict F(T_pillar) from fitted curve
+        3. Compare to observed F_pillar
+        4. Compute error in bps
+    
+    This function integrates with the recipe system and prepare_pillars to efficiently
+    evaluate out-of-sample prediction performance.
+    
+    Args:
+        store: OrderbookStore instance
+        dates: List of dates to evaluate
+        forwards_recipe: Recipe function (e.g., build_forwards_pchip or build_forwards_kalman)
+        recipe_kwargs: Optional dict of kwargs to pass to recipe (e.g., binning, tau_ewma_minutes)
+        
+    Returns:
+        DataFrame with columns:
+            - timeMs: Observation timestamp
+            - pillar_idx: Index of dropped pillar
+            - symbol: Contract symbol (e.g., 'BTC-USD-251031.OK')
+            - T: Time to maturity (years)
+            - F_bid_obs, F_ask_obs: Observed forward prices
+            - F_bid_pred, F_ask_pred: Predicted forward prices
+            - error_bid_bps, error_ask_bps, error_mid_bps: Errors in basis points
+            - success: Whether prediction succeeded
+            
+    Examples:
+        >>> from functools import partial
+        >>> from forwards.evaluation import loeo_error
+        >>> from okx.recipes.forwards import build_forwards_pchip
+        >>> 
+        >>> # Evaluate PCHIP recipe
+        >>> recipe = build_forwards_pchip
+        >>> kwargs = {'binning': '5m', 'tau_ewma_minutes': 5.0}
+        >>> df_loeo = loeo_error(store, dates, recipe, kwargs)
+        >>> 
+        >>> # Compute summary statistics
+        >>> print(df_loeo.filter(pl.col('success'))['error_mid_bps'].describe())
+    """
+    if recipe_kwargs is None:
+        recipe_kwargs = {}
+    
+    # Import here to avoid circular dependency
+    from okx.recipes.forwards import prepare_pillars
+    
+    # First, get the full pillar data without dropping anything to determine n_pillars per snapshot
+    inst_family = recipe_kwargs.get('inst_family', 'BTC-USD')
+    binning = recipe_kwargs.get('binning', '5m')
+    min_time_to_expiry_hours = recipe_kwargs.get('min_time_to_expiry_hours', 2.0)
+    unique_times = recipe_kwargs.get('unique_times', None)
+    cache_name_suffix = recipe_kwargs.get('cache_name_suffix', '_pillars')
+    
+    # Get reference snapshots to determine number of pillars at each time
+    snapshots_ref = prepare_pillars(
+        store, inst_family, dates, binning,
+        min_time_to_expiry_hours=min_time_to_expiry_hours,
+        unique_times=unique_times,
+        cache_name_suffix=cache_name_suffix,
+        drop_pillar_idx=None,
+    )
+    
+    if not snapshots_ref:
+        return pl.DataFrame()
+    
+    results = []
+    
+    # For each snapshot, determine the number of pillars
+    for timeMs, pillars_df in snapshots_ref.items():
+        n_pillars = len(pillars_df)
+        
+        # Skip SWAP (idx 0) since it's the anchor
+        for pillar_idx in range(1, n_pillars):
+            # Get observed data for this pillar
+            pillar_row = pillars_df[pillar_idx]
+            symbol_held_out = pillar_row['symbol'][0]
+            T_held_out = pillar_row['T'][0]
+            F_bid_obs = np.exp(pillar_row['ln_bid_1_px'][0])
+            F_ask_obs = np.exp(pillar_row['ln_ask_1_px'][0])
+            
+            try:
+                # Build curve with this pillar dropped
+                # Pass unique_times to only build for this specific timestamp
+                recipe_kwargs_loeo = recipe_kwargs.copy()
+                recipe_kwargs_loeo['drop_pillar_idx'] = pillar_idx
+                recipe_kwargs_loeo['unique_times'] = [timeMs]
+                recipe_kwargs_loeo['dates'] = dates
+                
+                # Remove cache_name_suffix - it's not a valid recipe parameter
+                recipe_kwargs_loeo.pop('cache_name_suffix', None)
+                
+                # Build curve without EWMA smoothing to get single-snapshot prediction
+                # (EWMA would require full time series context)
+                if 'tau_ewma_minutes' in recipe_kwargs_loeo:
+                    # For PCHIP, set tau very small to effectively disable smoothing
+                    recipe_kwargs_loeo['tau_ewma_minutes'] = 0.001
+                
+                lf_pred = forwards_recipe(store, **recipe_kwargs_loeo)
+                df_pred = lf_pred.collect()
+                
+                if df_pred.is_empty():
+                    raise ValueError("Recipe returned empty DataFrame")
+                
+                # Get the curve for this timestamp
+                df_curve = df_pred.filter(pl.col('timeMs') == timeMs)
+                
+                if df_curve.is_empty():
+                    raise ValueError(f"No curve found for timeMs={timeMs}")
+                
+                # Reconstruct forward at held-out maturity using interpolation
+                # Import PCHIPCurve for reconstruction
+                from forwards.pchip import PCHIPCurve, reconstruct_forward
+                
+                # Create PCHIPCurve object from the fitted data
+                curve = PCHIPCurve(
+                    timeMs=timeMs,
+                    T_nodes=df_curve['T'].to_numpy(),
+                    ln_F_bid_nodes=np.log(df_curve['F_bid'].to_numpy()),
+                    ln_F_ask_nodes=np.log(df_curve['F_ask'].to_numpy()),
+                    symbols=df_curve['symbol'].to_list(),
+                )
+                
+                # Reconstruct at held-out maturity
+                F_bid_pred, F_ask_pred = reconstruct_forward(curve, T_held_out)
+                
+                # Compute errors in bps
+                error_bid_bps = np.abs(np.log(F_bid_pred) - np.log(F_bid_obs)) * 10000
+                error_ask_bps = np.abs(np.log(F_ask_pred) - np.log(F_ask_obs)) * 10000
+                error_mid_bps = (error_bid_bps + error_ask_bps) / 2
+                
+                results.append({
+                    'timeMs': timeMs,
+                    'pillar_idx': pillar_idx,
+                    'symbol': symbol_held_out,
+                    'T': T_held_out,
+                    'F_bid_obs': F_bid_obs,
+                    'F_ask_obs': F_ask_obs,
+                    'F_bid_pred': float(F_bid_pred),
+                    'F_ask_pred': float(F_ask_pred),
+                    'error_bid_bps': float(error_bid_bps),
+                    'error_ask_bps': float(error_ask_bps),
+                    'error_mid_bps': float(error_mid_bps),
+                    'success': True,
+                })
+                
+            except Exception as e:
+                results.append({
+                    'timeMs': timeMs,
+                    'pillar_idx': pillar_idx,
+                    'symbol': symbol_held_out,
+                    'T': T_held_out,
+                    'F_bid_obs': F_bid_obs,
+                    'F_ask_obs': F_ask_obs,
+                    'F_bid_pred': None,
+                    'F_ask_pred': None,
+                    'error_bid_bps': None,
+                    'error_ask_bps': None,
+                    'error_mid_bps': None,
+                    'success': False,
+                    'error': str(e),
+                })
+    
+    return pl.DataFrame(results)
+

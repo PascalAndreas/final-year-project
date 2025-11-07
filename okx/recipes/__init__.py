@@ -10,10 +10,16 @@ from .forwards import (
     build_forwards_kalman,
     prepare_pillars,
 )
+from .options_eval import (
+    build_forwards_options_comparison,
+    prepare_options
+)
 
 __all__ = [
     "build_forwards_pchip",
     "build_forwards_kalman",
     "prepare_pillars",
+    "build_forwards_options_comparison",
+    "prepare_options",
 ]
 

@@ -54,7 +54,6 @@ def _make_early_roll_filter(min_time_to_expiry_hours: float):
         return lf.filter(time_to_expiry_seconds >= min_seconds)
     return filter_fn
 
-
 def prepare_pillars(
     store,
     inst_family: str,
@@ -71,7 +70,9 @@ def prepare_pillars(
     Returns dict mapping timeMs -> pillars_df where each DataFrame contains
     SWAP (at T=0) followed by FUTURES sorted by maturity. All data is in log-space.
     """
+    # =============================================================================
     # Build feature list (ordered for performance: trim early to reduce columns)
+    # =============================================================================
     features_base = ['trim', _drop_unneeded_columns]
     if binning:
         features_base.append('bin')
@@ -86,8 +87,17 @@ def prepare_pillars(
     features_futures = features_base.copy()
     features_futures.append(_make_early_roll_filter(min_time_to_expiry_hours))
     
-    # Build cache name if binning
-    cache_name = f"{binning}{cache_name_suffix}" if binning else None
+    # =============================================================================
+    # Fetch SWAP and FUTURES data
+    # =============================================================================
+    # Use unique cache name when drop_pillar_idx is set (data will be different)
+    if binning:
+        if drop_pillar_idx is None:
+            cache_name = f"{binning}{cache_name_suffix}"
+        else:
+            cache_name = f"{binning}_loeo_drop{drop_pillar_idx}"
+    else:
+        cache_name = None
     
     # Shared parameters
     shared_params = {
@@ -119,7 +129,9 @@ def prepare_pillars(
     if df_swap.is_empty() or df_futures.is_empty():
         return {}
     
-    # Determine timestamps
+    # =============================================================================
+    # Concatenation and dict building
+    # =============================================================================
     if unique_times is not None:
         times = sorted(unique_times)
     else:
@@ -129,7 +141,7 @@ def prepare_pillars(
             df_futures.select('timeMs')
         ]).unique().sort('timeMs')['timeMs'].to_list()
     
-    # Build snapshot dict
+    # Build snapshot dict (timeMs -> pillars_df)
     snapshots = {}
     df_swap_sorted = df_swap.sort('timeMs')
     unique_symbols = df_futures['symbol'].unique().to_list()
@@ -353,4 +365,3 @@ def build_forwards_kalman(
     df_result = states_to_polars(states)
     
     return df_result.lazy()
-

@@ -6,7 +6,7 @@ from .helpers import (
     standardize_orderbook_columns,
     trim_orderbook_polars, bin_orderbook_polars
 )
-from .store import OrderbookStore, populate, FEATURES
+from .store import OrderbookStore, FEATURES
 
 __all__ = [
     'fetch_market_data',
@@ -19,7 +19,6 @@ __all__ = [
     'trim_orderbook_polars',
     'bin_orderbook_polars',
     'OrderbookStore',
-    'populate',
     'FEATURES'
 ]
 

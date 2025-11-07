@@ -26,6 +26,7 @@ from .kalman_ns import (
 from .evaluation import (
     wmae_pillar_fit,
     leave_one_expiry_out,
+    loeo_error,
     temporal_smoothness,
     calendar_spread_check,
     diagnostics,
@@ -60,6 +61,7 @@ __all__ = [
     # Evaluation
     "wmae_pillar_fit",
     "leave_one_expiry_out",
+    "loeo_error",
     "temporal_smoothness",
     "calendar_spread_check",
     "diagnostics",

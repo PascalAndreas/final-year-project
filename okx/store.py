@@ -10,8 +10,9 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Callable
 import polars as pl
 from .api import fetch_orderbook_lazy
-from .helpers import trim_orderbook_polars, bin_orderbook_polars, add_tenor_polars, log_prices_polars, exp_prices_polars
+
 from tqdm.auto import tqdm
+from .features import trim_ob, strip_ob, parse_option, bin_ob, log_prices, exp_prices, add_tenor
 
 # Common feature expressions for derived orderbooks
 # 
@@ -290,9 +291,9 @@ class OrderbookStore:
         if not features:
             # No features: apply trim then bin
             if depth is not None:
-                lf = trim_orderbook_polars(lf, depth)
+                lf = trim_ob(lf, depth)
             if binning is not None:
-                lf = bin_orderbook_polars(lf, binning)
+                lf = bin_ob(lf, binning)
             return lf
         
         # Helper to flush accumulated feature expressions
@@ -304,11 +305,13 @@ class OrderbookStore:
         # Callable features that require flushing before execution
         # Each returns (LazyFrame, was_applied: bool)
         FLUSH_FEATURES = {
-            'trim': lambda lf: (trim_orderbook_polars(lf, depth), True) if depth is not None else (lf, False),
-            'bin': lambda lf: (bin_orderbook_polars(lf, binning), True) if binning is not None else (lf, False),
-            'tenor': lambda lf: (add_tenor_polars(lf, inst_type), True),
-            'log': lambda lf: (log_prices_polars(lf), True),
-            'exp': lambda lf: (exp_prices_polars(lf), True),
+            'trim': lambda lf: (trim_ob(lf, depth), True) if depth is not None else (lf, False),
+            'bin': lambda lf: (bin_ob(lf, binning), True) if binning is not None else (lf, False),
+            'tenor': lambda lf: (add_tenor(lf, inst_type), True),
+            'log': lambda lf: (log_prices(lf), True),
+            'exp': lambda lf: (exp_prices(lf), True),
+            'strip': lambda lf: (strip_ob(lf), True),
+            'parse_option': lambda lf: (parse_option(lf), True),
         }
         
         # Process features list in order
@@ -344,9 +347,9 @@ class OrderbookStore:
         
         # Apply trim/bin if not explicitly ordered
         if not trim_applied and depth is not None:
-            lf = trim_orderbook_polars(lf, depth)
+            lf = trim_ob(lf, depth)
         if not bin_applied and binning is not None:
-            lf = bin_orderbook_polars(lf, binning)
+            lf = bin_ob(lf, binning)
         
         return lf
 

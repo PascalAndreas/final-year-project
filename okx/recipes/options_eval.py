@@ -24,47 +24,7 @@ import numpy as np
 from datetime import date
 from typing import Callable, Optional
 
-
-# =============================================================================
-# Helper functions for options preprocessing
-# =============================================================================
-
-def _add_option_metadata(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """
-    Add strike, opt_type, and moneyness columns to options data.
-    
-    Expects: symbol, spot_ref columns
-    Returns: adds strike, opt_type, moneyness columns
-    """
-    from okx.helpers import parse_option_name
-    
-    def extract_strike(symbol: str):
-        try:
-            _, _, strike, _ = parse_option_name(symbol)
-            return strike
-        except:
-            return None
-    
-    def extract_opt_type(symbol: str):
-        try:
-            _, _, _, opt_type = parse_option_name(symbol)
-            return opt_type
-        except:
-            return None
-    
-    df = lf.collect()
-    df = df.with_columns([
-        pl.col('symbol').map_elements(extract_strike, return_dtype=pl.Int64).alias('strike'),
-        pl.col('symbol').map_elements(extract_opt_type, return_dtype=pl.String).alias('opt_type'),
-    ])
-    
-    # Add moneyness if spot_ref exists
-    if 'spot_ref' in df.columns:
-        df = df.with_columns(
-            (pl.col('strike') / pl.col('spot_ref')).alias('moneyness')
-        )
-    
-    return df.lazy()
+from okx.recipes.helpers import early_roll
 
 
 # =============================================================================
@@ -108,16 +68,28 @@ def prepare_options(
             - strike, opt_type ('C' or 'P'), moneyness
             - F_fitted_bid, F_fitted_ask (from forward curve)
     """
+    # Shared base parameters for data loading
+    shared_base = {
+        'inst_family': inst_family,
+        'dates': dates,
+    }
+    
+    # Add binning if specified
+    if binning is not None:
+        shared_base['binning'] = binning
+    
+    # Build options feature list
+    options_features = ['trim', 'strip', 'tenor', early_roll(min_time_to_expiry_hours), 'parse_option']
+    
     # Load options orderbook
     cache_name = f'1{cache_name_suffix}'
     
     lf_options = store.get(
-        inst_family=inst_family,
         inst_type='OPTION',
-        dates=dates,
         depth=1,
-        features=['trim', 'tenor'],
+        features=options_features,
         cache_name=cache_name,
+        **shared_base,
     )
     
     df_options = lf_options.collect()
@@ -125,23 +97,16 @@ def prepare_options(
     if df_options.is_empty():
         return pl.DataFrame()
     
-    # Filter by time to expiry
-    min_seconds = min_time_to_expiry_hours * 3600
-    df_options = df_options.filter(
-        ((pl.col('expiry') - pl.col('timeMs')) / 1000.0) >= min_seconds
-    )
+    # Load SWAP for spot reference using depth=0 to get mid price directly
+    # Don't include 'tenor' for SWAP (perpetual has no expiry)
+    swap_features = ['trim', 'strip']
     
-    if df_options.is_empty():
-        return pl.DataFrame()
-    
-    # Load SWAP for spot reference
     lf_swap = store.get(
-        inst_family=inst_family,
         inst_type='SWAP',
-        dates=dates,
-        depth=1,
-        features=['trim', 'mid'],
-        cache_name='1_mid',
+        depth=0,
+        features=swap_features,
+        cache_name='ref',
+        **shared_base,
     )
     
     df_swap = lf_swap.collect()
@@ -156,10 +121,12 @@ def prepare_options(
     # Filter out rows without spot reference
     df_options = df_options.filter(pl.col('spot_ref').is_not_null())
     
-    # Add strike, opt_type, and moneyness
-    df_options = _add_option_metadata(df_options.lazy()).collect()
+    # Add moneyness (requires spot_ref from SWAP join)
+    df_options = df_options.with_columns(
+        (pl.col('strike') / pl.col('spot_ref')).alias('moneyness')
+    )
     
-    # Filter out failed parses
+    # Filter out failed parses (null strike or opt_type)
     df_options = df_options.filter(
         pl.col('strike').is_not_null() & pl.col('opt_type').is_not_null()
     )
@@ -171,11 +138,10 @@ def prepare_options(
     # Build forward curves and add to options
     # =========================================================================
     
-    # Get unique timestamps from options data
-    unique_times = df_options['timeMs'].unique().sort().to_list()
-    
     # Build forward curves
     if binning is None:
+        # Get unique timestamps from options data
+        unique_times = df_options['timeMs'].unique().sort().to_list()
         lf_forwards = forwards_recipe(
             store,
             dates=dates,
@@ -184,6 +150,7 @@ def prepare_options(
             unique_times=unique_times,
         )
     else:
+        # Use binning - forwards will be at binned timestamps
         lf_forwards = forwards_recipe(
             store,
             dates=dates,

@@ -18,18 +18,11 @@ from typing import Optional, Tuple
 
 from forwards.pchip import fit_pchip_curve, ewma_smooth, curves_to_polars, PCHIPCurve
 from forwards.kalman_ns import kalman_filter, states_to_polars
+from okx.recipes.helpers import early_roll
 
 # =============================================================================
 # Pillar preparation
 # =============================================================================
-
-def _drop_unneeded_columns(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Drop columns not needed for forward curve fitting."""
-    needed_columns = ['timeMs', 'symbol', 'bid_1_px', 'ask_1_px']
-    # Keep only columns that exist in the frame
-    existing_columns = lf.collect_schema().names()
-    keep_columns = [col for col in needed_columns if col in existing_columns]
-    return lf.select(keep_columns)
 
 
 def _finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -44,15 +37,6 @@ def _finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
         .with_columns(pl.col('time_bin').dt.epoch('ms').alias('timeMs'))
         .drop('time_bin')
     )
-
-
-def _make_early_roll_filter(min_time_to_expiry_hours: float):
-    """Create early-roll filter callable for use in feature pipeline."""
-    def filter_fn(lf: pl.LazyFrame) -> pl.LazyFrame:
-        min_seconds = min_time_to_expiry_hours * 3600
-        time_to_expiry_seconds = (pl.col('expiry') - pl.col('timeMs')) / 1000.0
-        return lf.filter(time_to_expiry_seconds >= min_seconds)
-    return filter_fn
 
 def prepare_pillars(
     store,
@@ -71,9 +55,9 @@ def prepare_pillars(
     SWAP (at T=0) followed by FUTURES sorted by maturity. All data is in log-space.
     """
     # =============================================================================
-    # Build feature list (ordered for performance: trim early to reduce columns)
+    # Build feature list (ordered for performance: strip early to reduce columns)
     # =============================================================================
-    features_base = ['trim', _drop_unneeded_columns]
+    features_base = ['trim', 'strip']
     if binning:
         features_base.append('bin')
     features_base.extend(['spread', 'rel_spread', 'tenor', 'log'])  # Added 'log' feature
@@ -85,7 +69,7 @@ def prepare_pillars(
     
     # FUTURES features (add early-roll filter after tenor)
     features_futures = features_base.copy()
-    features_futures.append(_make_early_roll_filter(min_time_to_expiry_hours))
+    features_futures.append(early_roll(min_time_to_expiry_hours))
     
     # =============================================================================
     # Fetch SWAP and FUTURES data

@@ -4,9 +4,8 @@ from .helpers import (
     get_option_combos, 
     trim_orderbook, bin_orderbook,
     standardize_orderbook_columns,
-    trim_orderbook_polars, bin_orderbook_polars
 )
-from .store import OrderbookStore, FEATURES
+from .store import OrderbookStore
 
 __all__ = [
     'fetch_market_data',
@@ -16,9 +15,6 @@ __all__ = [
     'trim_orderbook',
     'bin_orderbook',
     'standardize_orderbook_columns',
-    'trim_orderbook_polars',
-    'bin_orderbook_polars',
     'OrderbookStore',
-    'FEATURES'
 ]
 

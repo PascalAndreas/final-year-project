@@ -16,3 +16,10 @@ def early_roll(min_time_to_expiry_hours: float):
         return lf.filter(time_to_expiry_seconds >= min_seconds)
     return filter_fn
 
+def finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Finalize binning by promoting time_bin to timeMs and dropping old timeMs column."""
+    return (lf
+        .drop('timeMs')
+        .with_columns(pl.col('time_bin').dt.epoch('ms').alias('timeMs'))
+        .drop('time_bin')
+    )

@@ -178,8 +178,10 @@ class OrderbookStore:
     
     def _ensure_cached(self, inst_family: str, inst_type: str, dates: list[date],
                        builder: Callable[[list[date]], pl.LazyFrame],
-                       cache_name: str) -> None:
+                       cache_name: Optional[str] = None) -> None:
         """Build and cache missing dates."""
+        if cache_name is None:
+            return
         missing_dates = [d for d in dates 
                         if not self.manifest.have(inst_family, inst_type, d, cache_name)]
         

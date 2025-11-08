@@ -30,20 +30,22 @@ def trim_ob(lf: pl.LazyFrame, n_levels: int = 5) -> pl.LazyFrame:
 
 def strip_ob(lf: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Strip orderbook to minimal columns: timeMs, symbol, and top-level prices.
+    Strip orderbook to minimal columns: timeMs, symbol, time_bin (if present), and top-level prices.
     
     Works with both regular and log-space prices:
     - Regular: keeps bid_1_px, ask_1_px (or mid if present)
     - Log-space: keeps ln_bid_1_px, ln_ask_1_px (or ln_mid if present)
     
     Returns:
-        LazyFrame with only [timeMs, symbol, price columns]
+        LazyFrame with only [timeMs, symbol, (time_bin), price columns]
     """
     schema = lf.collect_schema()
     cols = schema.names()
     
-    # Base columns to always keep
+    # Base columns to always keep, include time_bin if present
     keep_cols = ['timeMs', 'symbol']
+    if 'time_bin' in cols:
+        keep_cols.append('time_bin')
     
     # Check for log-space vs regular prices
     if 'ln_bid_1_px' in cols and 'ln_ask_1_px' in cols:

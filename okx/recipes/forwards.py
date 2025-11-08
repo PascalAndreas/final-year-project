@@ -18,25 +18,12 @@ from typing import Optional, Tuple
 
 from forwards.pchip import fit_pchip_curve, ewma_smooth, curves_to_polars, PCHIPCurve
 from forwards.kalman_ns import kalman_filter, states_to_polars
-from okx.recipes.helpers import early_roll
+from okx.recipes.helpers import early_roll, finalize_binning
 
 # =============================================================================
 # Pillar preparation
 # =============================================================================
 
-
-def _finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """
-    Finalize binning by promoting time_bin to timeMs and dropping old time columns.
-    
-    After binning, time_bin contains the aligned timestamps as datetime.
-    This function converts it to epoch milliseconds (int64) to match timeMs format.
-    """
-    return (lf
-        .drop('timeMs')
-        .with_columns(pl.col('time_bin').dt.epoch('ms').alias('timeMs'))
-        .drop('time_bin')
-    )
 
 def prepare_pillars(
     store,
@@ -44,7 +31,6 @@ def prepare_pillars(
     dates: list[date],
     binning: Optional[str] = None,
     min_time_to_expiry_hours: float = 2.0,
-    cache_name_suffix: str = "_pillars",
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
 ) -> dict[int, pl.DataFrame]:
@@ -60,9 +46,8 @@ def prepare_pillars(
     features_base = ['trim', 'strip']
     if binning:
         features_base.append('bin')
+        features_base.append(finalize_binning)
     features_base.extend(['spread', 'rel_spread', 'tenor', 'log'])  # Added 'log' feature
-    if binning:
-        features_base.append(_finalize_binning)
     
     # SWAP features (no early-roll filter)
     features_swap = features_base.copy()
@@ -74,14 +59,8 @@ def prepare_pillars(
     # =============================================================================
     # Fetch SWAP and FUTURES data
     # =============================================================================
-    # Use unique cache name when drop_pillar_idx is set (data will be different)
-    if binning:
-        if drop_pillar_idx is None:
-            cache_name = f"{binning}{cache_name_suffix}"
-        else:
-            cache_name = f"{binning}_loeo_drop{drop_pillar_idx}"
-    else:
-        cache_name = None
+
+    cache_name = 'full_pillars' if binning is None else f'{binning}_pillars'
     
     # Shared parameters
     shared_params = {

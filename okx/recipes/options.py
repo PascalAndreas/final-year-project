@@ -23,8 +23,54 @@ import polars as pl
 import numpy as np
 from datetime import date
 from typing import Callable, Optional
+from functools import partial
 
-from okx.recipes.helpers import early_roll
+from okx.recipes.helpers import early_roll, finalize_binning
+
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+def _get_recipe_name(recipe: Callable) -> str:
+    """Extract function name from recipe (handles functools.partial)."""
+    if isinstance(recipe, partial):
+        return recipe.func.__name__
+    return recipe.__name__
+
+
+def _reconstruct_forward_pchip(df_curve: pl.DataFrame, T_target: float | np.ndarray) -> tuple[float | np.ndarray, float | np.ndarray]:
+    """Reconstruct forward from PCHIP curve."""
+    from forwards.pchip import PCHIPCurve, reconstruct_forward
+    
+    curve = PCHIPCurve(
+        timeMs=int(df_curve['timeMs'][0]),
+        T_nodes=df_curve['T'].to_numpy(),
+        ln_F_bid_nodes=np.log(df_curve['F_bid'].to_numpy()),
+        ln_F_ask_nodes=np.log(df_curve['F_ask'].to_numpy()),
+        symbols=df_curve['symbol'].to_list(),
+    )
+    return reconstruct_forward(curve, T_target)
+
+
+def _reconstruct_forward_kalman(df_curve: pl.DataFrame, T_target: float | np.ndarray) -> tuple[float | np.ndarray, float | np.ndarray]:
+    """Reconstruct forward from Kalman NS state."""
+    from forwards.kalman_ns import NSCarryState, reconstruct_ns_forward
+    
+    state = NSCarryState.from_polars(df_curve)
+    F_bid = reconstruct_ns_forward(state, T_target, use_bid=True)
+    F_ask = reconstruct_ns_forward(state, T_target, use_bid=False)
+    return F_bid, F_ask
+
+
+def _get_reconstruct_fn(recipe_name: str) -> Callable:
+    """Get the appropriate reconstruction function based on recipe name."""
+    if 'pchip' in recipe_name.lower():
+        return _reconstruct_forward_pchip
+    elif 'kalman' in recipe_name.lower():
+        return _reconstruct_forward_kalman
+    else:
+        raise ValueError(f"Unknown recipe type: {recipe_name}")
 
 
 # =============================================================================
@@ -38,17 +84,16 @@ def prepare_options(
     forwards_recipe: Callable,
     binning: Optional[str] = None,
     min_time_to_expiry_hours: float = 2.0,
-    cache_name_suffix: str = "_options",
 ) -> pl.DataFrame:
     """
-    Prepare options data with spot reference, metadata, and fitted forward prices.
+    Prepare options data with metadata and fitted forward prices.
     
     This function:
     - Loads options orderbook data
-    - Joins with SWAP for spot reference
-    - Adds strike, opt_type, moneyness columns
-    - Builds forward curves using the provided recipe
+    - Adds strike, opt_type columns
+    - Builds forward curves using the provided recipe (via get_derived for caching)
     - Adds F_fitted_bid, F_fitted_ask columns for each option
+    - Calculates moneyness as strike / F_fitted_mid
     - Returns ALL options (calls and puts, paired or unpaired)
     
     Args:
@@ -56,75 +101,45 @@ def prepare_options(
         inst_family: Instrument family (e.g., 'BTC-USD')
         dates: List of dates to load
         forwards_recipe: Pre-configured recipe function (use functools.partial)
-        binning: Binning interval ('1m', '5m', etc) or None to use unique option timestamps
+        binning: Binning interval ('1m', '5m', etc) or None for unbinned
         min_time_to_expiry_hours: Minimum time to expiry (default: 2.0)
-        cache_name_suffix: Suffix for cache name (default: '_options')
         
     Returns:
         DataFrame with columns:
             - timeMs, symbol, expiry, T
             - bid_1_px, ask_1_px
-            - spot_ref (from SWAP)
-            - strike, opt_type ('C' or 'P'), moneyness
+            - strike, opt_type ('C' or 'P')
             - F_fitted_bid, F_fitted_ask (from forward curve)
+            - moneyness (strike / F_fitted_mid)
     """
-    # Shared base parameters for data loading
-    shared_base = {
-        'inst_family': inst_family,
-        'dates': dates,
-    }
     
-    # Add binning if specified
-    if binning is not None:
-        shared_base['binning'] = binning
+    # =============================================================================
+    # Fetch options orderbook
+    # =============================================================================
     
-    # Build options feature list
-    options_features = ['trim', 'strip', 'tenor', early_roll(min_time_to_expiry_hours), 'parse_option']
+    cache_name = 'full_options' if binning is None else f'{binning}_options'
+    
+    # Build feature list
+    options_features = ['trim', 'strip']
+    if binning:
+        options_features.extend(['bin', finalize_binning])
+    options_features.extend(['tenor', early_roll(min_time_to_expiry_hours), 'parse_option'])
     
     # Load options orderbook
-    cache_name = f'1{cache_name_suffix}'
-    
     lf_options = store.get(
         inst_type='OPTION',
+        inst_family=inst_family,
+        dates=dates,
         depth=1,
+        binning=binning,
         features=options_features,
         cache_name=cache_name,
-        **shared_base,
     )
     
     df_options = lf_options.collect()
     
     if df_options.is_empty():
         return pl.DataFrame()
-    
-    # Load SWAP for spot reference using depth=0 to get mid price directly
-    # Don't include 'tenor' for SWAP (perpetual has no expiry)
-    swap_features = ['trim', 'strip']
-    
-    lf_swap = store.get(
-        inst_type='SWAP',
-        depth=0,
-        features=swap_features,
-        cache_name='ref',
-        **shared_base,
-    )
-    
-    df_swap = lf_swap.collect()
-    
-    if df_swap.is_empty():
-        return pl.DataFrame()
-    
-    # Join with spot reference (both must be sorted for join_asof)
-    df_swap = df_swap.sort('timeMs').select(['timeMs', 'mid']).rename({'mid': 'spot_ref'})
-    df_options = df_options.sort('timeMs').join_asof(df_swap, on='timeMs', strategy='backward')
-    
-    # Filter out rows without spot reference
-    df_options = df_options.filter(pl.col('spot_ref').is_not_null())
-    
-    # Add moneyness (requires spot_ref from SWAP join)
-    df_options = df_options.with_columns(
-        (pl.col('strike') / pl.col('spot_ref')).alias('moneyness')
-    )
     
     # Filter out failed parses (null strike or opt_type)
     df_options = df_options.filter(
@@ -138,26 +153,32 @@ def prepare_options(
     # Build forward curves and add to options
     # =========================================================================
     
-    # Build forward curves
-    if binning is None:
-        # Get unique timestamps from options data
-        unique_times = df_options['timeMs'].unique().sort().to_list()
-        lf_forwards = forwards_recipe(
-            store,
-            dates=dates,
-            inst_family=inst_family,
-            binning=None,
-            unique_times=unique_times,
-        )
+    # Extract parameters from the partial to build cache name
+    if isinstance(forwards_recipe, partial):
+        # Build cache name from the partial's keywords
+        params = forwards_recipe.keywords
+        cache_parts = [recipe_name]
+        if 'binning' in params and params['binning']:
+            cache_parts.insert(0, params['binning'])
+        if 'tau_ewma_minutes' in params:
+            cache_parts.append(f"tau{params['tau_ewma_minutes']:.1f}")
+        if 'lambda_ns' in params:
+            cache_parts.append(f"lambda{params['lambda_ns']:.1f}")
+        forwards_cache_name = "_".join(cache_parts)
     else:
-        # Use binning - forwards will be at binned timestamps
-        lf_forwards = forwards_recipe(
-            store,
-            dates=dates,
-            inst_family=inst_family,
-            binning=binning,
-        )
+        forwards_cache_name = recipe_name
     
+    # Get reconstruction function based on recipe type
+    recipe_name = _get_recipe_name(forwards_recipe)
+    reconstruct_fn = _get_reconstruct_fn(recipe_name)
+    
+    # Build forward curves using get_derived for caching
+    # If no binning, add unique_times to the recipe via another partial
+    if binning is None:
+        unique_times = df_options['timeMs'].unique().sort().to_list()
+        forwards_recipe = partial(forwards_recipe, unique_times=unique_times)
+    
+    lf_forwards = store.get_derived(forwards_recipe_with_times, dates=dates, cache_name=forwards_cache_name)
     df_forwards = lf_forwards.collect()
     
     if df_forwards.is_empty():
@@ -182,13 +203,17 @@ def prepare_options(
         
         try:
             # Reconstruct forwards for all T values at once
-            F_fitted_bids, F_fitted_asks = _detect_and_reconstruct_forward(df_curve, T_values)
+            F_fitted_bids, F_fitted_asks = reconstruct_fn(df_curve, T_values)
+            F_fitted_mids = (F_fitted_bids + F_fitted_asks) / 2
             
-            # Add forward prices to options
+            # Add forward prices and moneyness to options
             options_with_forwards = options_at_time.with_columns([
                 pl.Series('F_fitted_bid', F_fitted_bids),
                 pl.Series('F_fitted_ask', F_fitted_asks),
-            ])
+                pl.Series('F_fitted_mid', F_fitted_mids),
+            ]).with_columns(
+                (pl.col('strike') / pl.col('F_fitted_mid')).alias('moneyness')
+            )
             
             results.append(options_with_forwards)
             
@@ -200,53 +225,6 @@ def prepare_options(
         return pl.DataFrame()
     
     return pl.concat(results)
-
-
-def _detect_and_reconstruct_forward(df_curve: pl.DataFrame, T_target: float | np.ndarray) -> tuple[float | np.ndarray, float | np.ndarray]:
-    """
-    Detect curve type from DataFrame columns and reconstruct forward price.
-    
-    Automatically handles both PCHIP curves and Kalman NS states by inspecting
-    the DataFrame column structure.
-    
-    Args:
-        df_curve: Forward curve DataFrame (single timestamp)
-        T_target: Target maturity in years (scalar or array)
-        
-    Returns:
-        (F_bid, F_ask) tuple at target maturity
-        
-    Notes:
-        - PCHIP curves have: timeMs, T, F_bid, F_ask, symbol, ln_F_bid, ln_F_ask
-        - Kalman states have: timeMs, beta0, beta1, beta2, lambda_ns, ln_F_ref_bid, ln_F_ref_ask
-    """
-    if 'F_bid' in df_curve.columns and 'T' in df_curve.columns:
-        # PCHIP curve - has pillar points, need to interpolate
-        from forwards.pchip import PCHIPCurve, reconstruct_forward
-        
-        curve = PCHIPCurve(
-            timeMs=int(df_curve['timeMs'][0]),
-            T_nodes=df_curve['T'].to_numpy(),
-            ln_F_bid_nodes=np.log(df_curve['F_bid'].to_numpy()),
-            ln_F_ask_nodes=np.log(df_curve['F_ask'].to_numpy()),
-            symbols=df_curve['symbol'].to_list(),
-        )
-        return reconstruct_forward(curve, T_target)
-        
-    elif 'beta0' in df_curve.columns:
-        # Kalman state - has NS parameters, need to reconstruct
-        from forwards.kalman_ns import NSCarryState, reconstruct_ns_forward
-        
-        state = NSCarryState.from_polars(df_curve)
-        F_bid = reconstruct_ns_forward(state, T_target, use_bid=True)
-        F_ask = reconstruct_ns_forward(state, T_target, use_bid=False)
-        return F_bid, F_ask
-        
-    else:
-        raise ValueError(
-            f"Unknown curve format. Expected PCHIP (F_bid, T) or Kalman (beta0, beta1, beta2). "
-            f"Got columns: {df_curve.columns}"
-        )
 
 
 # =============================================================================
@@ -288,8 +266,7 @@ def build_forwards_options_comparison(
             - expiry_dt: Option expiry timestamp (ms)
             - strike: Strike price (USD)
             - T: Time to maturity (years)
-            - spot_ref: Reference spot price from SWAP (USD)
-            - moneyness: strike / spot_ref
+            - moneyness: strike / F_fitted_mid
             - call_bid_1_px, call_ask_1_px: Call option prices (USD)
             - put_bid_1_px, put_ask_1_px: Put option prices (USD)
             - F_fitted_bid, F_fitted_ask, F_fitted_mid: Fitted forward prices (USD)
@@ -348,7 +325,7 @@ def build_forwards_options_comparison(
     
     # Separate calls and puts
     df_calls = df_options.filter(pl.col('opt_type') == 'C').select([
-        'timeMs', 'expiry', 'strike', 'T', 'spot_ref', 'moneyness',
+        'timeMs', 'expiry', 'strike', 'T', 'moneyness',
         'bid_1_px', 'ask_1_px', 'F_fitted_bid', 'F_fitted_ask'
     ]).rename({
         'bid_1_px': 'call_bid_1_px',

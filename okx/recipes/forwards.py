@@ -34,6 +34,8 @@ def prepare_pillars(
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
 ) -> dict[int, pl.DataFrame]:
+    import time
+    start_time = time.time()
     """
     Prepare concatenated pillar data from SWAP and FUTURES orderbooks.
     
@@ -85,10 +87,17 @@ def prepare_pillars(
         **shared_params,
     )
     
+    get_time = time.time()
+    print(f"get took {get_time - start_time:.3f} seconds")
+    
+    
     # Collect
     df_swap = lf_swap.collect()
     df_futures = lf_futures.collect()
-    
+
+    collect_time = time.time()
+    print(f"collect took {collect_time - get_time:.3f} seconds")
+
     if df_swap.is_empty() or df_futures.is_empty():
         return {}
     
@@ -103,6 +112,9 @@ def prepare_pillars(
             df_swap.select('timeMs'),
             df_futures.select('timeMs')
         ]).unique().sort('timeMs')['timeMs'].to_list()
+    
+    concat_time = time.time()
+    print(f"concat took {concat_time - collect_time:.3f} seconds")
     
     # Build snapshot dict (timeMs -> pillars_df)
     snapshots = {}

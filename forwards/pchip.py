@@ -87,8 +87,6 @@ class PCHIPCurve:
             "T": self.T_nodes,
             "ln_F_bid": self.ln_F_bid_nodes,
             "ln_F_ask": self.ln_F_ask_nodes,
-            "F_bid": np.exp(self.ln_F_bid_nodes),
-            "F_ask": np.exp(self.ln_F_ask_nodes),
             "symbol": self.symbols,
         })
 

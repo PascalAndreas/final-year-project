@@ -10,7 +10,7 @@ from .forwards import (
     build_forwards_kalman,
     prepare_pillars,
 )
-from .options_eval import (
+from .options import (
     build_forwards_options_comparison,
     prepare_options
 )
@@ -22,4 +22,3 @@ __all__ = [
     "build_forwards_options_comparison",
     "prepare_options",
 ]
-

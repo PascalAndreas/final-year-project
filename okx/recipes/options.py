@@ -153,6 +153,8 @@ def prepare_options(
     # Build forward curves and add to options
     # =========================================================================
     
+    recipe_name = _get_recipe_name(forwards_recipe)
+    
     # Extract parameters from the partial to build cache name
     if isinstance(forwards_recipe, partial):
         # Build cache name from the partial's keywords
@@ -169,16 +171,16 @@ def prepare_options(
         forwards_cache_name = recipe_name
     
     # Get reconstruction function based on recipe type
-    recipe_name = _get_recipe_name(forwards_recipe)
     reconstruct_fn = _get_reconstruct_fn(recipe_name)
     
     # Build forward curves using get_derived for caching
+    recipe_for_derivation = forwards_recipe
     # If no binning, add unique_times to the recipe via another partial
     if binning is None:
         unique_times = df_options['timeMs'].unique().sort().to_list()
-        forwards_recipe = partial(forwards_recipe, unique_times=unique_times)
+        recipe_for_derivation = partial(recipe_for_derivation, unique_times=unique_times)
     
-    lf_forwards = store.get_derived(forwards_recipe_with_times, dates=dates, cache_name=forwards_cache_name)
+    lf_forwards = store.get_derived(recipe_for_derivation, dates=dates, cache_name=forwards_cache_name)
     df_forwards = lf_forwards.collect()
     
     if df_forwards.is_empty():
@@ -390,20 +392,25 @@ def build_forwards_options_comparison(
     call_spread_bps = (call_asks - call_bids) / ((call_asks + call_bids) / 2) * 10000
     put_spread_bps = (put_asks - put_bids) / ((put_asks + put_bids) / 2) * 10000
     
-    # Add computed columns to df_pairs
-    df_result = df_pairs.with_columns([
-        pl.Series('F_fitted_mid', F_fitted_mids),
-        pl.Series('F_implied_bid', F_implied_bids),
-        pl.Series('F_implied_ask', F_implied_asks),
-        pl.Series('F_implied_mid', F_implied_mids),
-        pl.Series('error_bid_bps', error_bids_bps),
-        pl.Series('error_ask_bps', error_asks_bps),
-        pl.Series('error_mid_bps', error_mids_bps),
-        pl.Series('call_spread_bps', call_spread_bps),
-        pl.Series('put_spread_bps', put_spread_bps),
-    ]).rename({'expiry': 'expiry_dt'})
+    valid_series = pl.Series('valid_mask', valid_mask)
     
-    # Filter to valid rows
-    df_result = df_result.filter(pl.Series('valid', valid_mask))
+    # Add computed columns to df_pairs
+    df_result = (
+        df_pairs.with_columns([
+            pl.Series('F_fitted_mid', F_fitted_mids),
+            pl.Series('F_implied_bid', F_implied_bids),
+            pl.Series('F_implied_ask', F_implied_asks),
+            pl.Series('F_implied_mid', F_implied_mids),
+            pl.Series('error_bid_bps', error_bids_bps),
+            pl.Series('error_ask_bps', error_asks_bps),
+            pl.Series('error_mid_bps', error_mids_bps),
+            pl.Series('call_spread_bps', call_spread_bps),
+            pl.Series('put_spread_bps', put_spread_bps),
+            valid_series,
+        ])
+        .rename({'expiry': 'expiry_dt'})
+        .filter(pl.col('valid_mask'))
+        .drop('valid_mask')
+    )
     
     return df_result

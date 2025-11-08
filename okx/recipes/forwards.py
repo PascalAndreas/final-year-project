@@ -33,38 +33,34 @@ def prepare_pillars(
     min_time_to_expiry_hours: float = 2.0,
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
-) -> dict[int, pl.DataFrame]:
-    import time
-    start_time = time.time()
+    cache_name_suffix: str = "pillars",
+) -> pl.LazyFrame:
     """
     Prepare concatenated pillar data from SWAP and FUTURES orderbooks.
-    
-    Returns dict mapping timeMs -> pillars_df where each DataFrame contains
-    SWAP (at T=0) followed by FUTURES sorted by maturity. All data is in log-space.
+
+    Returns a LazyFrame sorted by (timeMs, T) that contains the latest snapshot
+    for each instrument at or before every requested timestamp. This keeps the
+    function compatible with store.get_derived() caching and avoids Python-side
+    looping over symbols/timestamps.
     """
-    # =============================================================================
+    if not dates:
+        return pl.DataFrame().lazy()
+
     # Build feature list (ordered for performance: strip early to reduce columns)
-    # =============================================================================
     features_base = ['trim', 'strip']
     if binning:
-        features_base.append('bin')
-        features_base.append(finalize_binning)
-    features_base.extend(['spread', 'rel_spread', 'tenor', 'log'])  # Added 'log' feature
-    
-    # SWAP features (no early-roll filter)
+        features_base.extend(['bin', finalize_binning])
+    features_base.extend(['spread', 'rel_spread', 'tenor', 'log'])
+
     features_swap = features_base.copy()
-    
-    # FUTURES features (add early-roll filter after tenor)
+
     features_futures = features_base.copy()
     features_futures.append(early_roll(min_time_to_expiry_hours))
-    
-    # =============================================================================
-    # Fetch SWAP and FUTURES data
-    # =============================================================================
 
-    cache_name = 'full_pillars' if binning is None else f'{binning}_pillars'
-    
-    # Shared parameters
+    suffix = cache_name_suffix or "pillars"
+    prefix = "full" if binning is None else binning
+    cache_name = f"{prefix}_{suffix}"
+
     shared_params = {
         'inst_family': inst_family,
         'dates': dates,
@@ -72,102 +68,92 @@ def prepare_pillars(
         'binning': binning,
         'cache_name': cache_name,
     }
-    
-    # Fetch SWAP (perpetual)
+
     lf_swap = store.get(
         inst_type='SWAP',
         features=features_swap,
         **shared_params,
-    )
-    
-    # Fetch FUTURES
+    ).sort('timeMs')
+
     lf_futures = store.get(
         inst_type='FUTURES',
         features=features_futures,
         **shared_params,
-    )
-    
-    get_time = time.time()
-    print(f"get took {get_time - start_time:.3f} seconds")
-    
-    
-    # Collect
-    df_swap = lf_swap.collect()
-    df_futures = lf_futures.collect()
+    ).sort(['symbol', 'timeMs'])
 
-    collect_time = time.time()
-    print(f"collect took {collect_time - get_time:.3f} seconds")
-
-    if df_swap.is_empty() or df_futures.is_empty():
-        return {}
-    
-    # =============================================================================
-    # Concatenation and dict building
-    # =============================================================================
     if unique_times is not None:
-        times = sorted(unique_times)
+        lf_times = pl.DataFrame({'timeMs': sorted(unique_times)}).lazy()
     else:
-        # Union of all timestamps from both dataframes
-        times = pl.concat([
-            df_swap.select('timeMs'),
-            df_futures.select('timeMs')
-        ]).unique().sort('timeMs')['timeMs'].to_list()
+        lf_times = (
+            pl.concat([
+                lf_swap.select('timeMs'),
+                lf_futures.select('timeMs'),
+            ])
+            .unique()
+            .sort('timeMs')
+        )
+
+    # Align swap snapshots to requested timestamps (latest observation <= timeMs)
+    lf_swap_snapshots = (
+        lf_times.join_asof(
+            lf_swap,
+            on='timeMs',
+            strategy='backward',
+            suffix='_hist',
+        )
+        .drop('timeMs_hist', strict=False)
+        .filter(pl.col('ln_bid_1_px').is_not_null())
+    )
+
+    lf_valid_times = lf_swap_snapshots.select('timeMs').unique()
+
+    # Align each futures symbol independently using cross join + asof
+    lf_symbol_times = (
+        lf_futures.select('symbol')
+        .unique()
+        .join(lf_valid_times, how='cross')
+    )
+    lf_futures_snapshots = (
+        lf_symbol_times.join_asof(
+            lf_futures,
+            on='timeMs',
+            by='symbol',
+            strategy='backward',
+            suffix='_hist',
+        )
+        .drop(['symbol_hist', 'timeMs_hist'], strict=False)
+        .filter(pl.col('ln_bid_1_px').is_not_null())
+        .filter(pl.col('expiry') > pl.col('timeMs'))
+    )
+
+    # Ensure consistent column order before concat
+    common_cols = ['timeMs', 'symbol', 'rel_spread', 'expiry', 'T', 
+                   'ln_bid_1_px', 'ln_ask_1_px', 'ln_spread']
     
-    concat_time = time.time()
-    print(f"concat took {concat_time - collect_time:.3f} seconds")
-    
-    # Build snapshot dict (timeMs -> pillars_df)
-    snapshots = {}
-    df_swap_sorted = df_swap.sort('timeMs')
-    unique_symbols = df_futures['symbol'].unique().to_list()
-    
-    for time in times:
-        df_time = pl.DataFrame({'timeMs': [time]})
-        
-        # Get most recent swap snapshot at or before this time
-        swap_matched = df_time.join_asof(df_swap_sorted, on='timeMs', strategy='backward')
-        if swap_matched.is_empty() or swap_matched['ln_bid_1_px'][0] is None:
-            continue
-        
-        # Get most recent snapshot for each futures symbol at or before this time
-        futures_at_time = []
-        for symbol in unique_symbols:
-            symbol_data = df_futures.filter(pl.col('symbol') == symbol).sort('timeMs')
-            if symbol_data.is_empty():
-                continue
-            matched = df_time.join_asof(symbol_data, on='timeMs', strategy='backward')
-            # Filter where expiry > timeMs (not expired) and has valid data
-            matched = matched.filter(
-                (pl.col('expiry') > pl.col('timeMs')) & 
-                (pl.col('ln_bid_1_px').is_not_null())
-            )
-            if not matched.is_empty():
-                futures_at_time.append(matched)
-        
-        if not futures_at_time:
-            continue
-        
-        # Concatenate all valid futures for this time and sort by T
-        futures_df = pl.concat(futures_at_time).sort('T')
-        
-        # Concatenate swap (T=0) with futures to create full pillars DataFrame
-        pillars_df = pl.concat([swap_matched, futures_df]).sort('T')
-        
-        # Drop pillar if specified (for LOEO evaluation)
-        if drop_pillar_idx is not None:
-            if drop_pillar_idx < len(pillars_df):
-                # Drop the specified pillar by index
-                pillars_df = pl.concat([
-                    pillars_df[:drop_pillar_idx],
-                    pillars_df[drop_pillar_idx + 1:]
-                ])
-            else:
-                # Index out of range, skip this snapshot
-                continue
-        
-        snapshots[time] = pillars_df
-    
-    return snapshots
+    pillars = pl.concat([
+        lf_swap_snapshots.select(common_cols),
+        lf_futures_snapshots.select(common_cols),
+    ])
+
+    pillars = (
+        pillars
+        .sort(['timeMs', 'T'])
+        .with_columns([
+            pl.int_range(pl.len()).over('timeMs').alias('pillar_idx'),
+            pl.len().over('timeMs').alias('_pillars_per_time'),
+        ])
+    )
+
+    if drop_pillar_idx is not None:
+        pillars = pillars.filter(
+            pl.col('_pillars_per_time') > drop_pillar_idx
+        ).filter(pl.col('pillar_idx') != drop_pillar_idx)
+
+    return (
+        pillars
+        .drop('_pillars_per_time')
+        .sort(['timeMs', 'T'])
+    )
 
 # =============================================================================
 # Helper functions for forward recipes
@@ -218,24 +204,28 @@ def build_forwards_pchip(
                         futures DataFrame will be dropped before fitting.
     """
     if not dates:
-        return pl.LazyFrame()
+        return pl.DataFrame().lazy()
     
     # Prepare pillar data with timestamp matching
-    snapshots = prepare_pillars(
+    pillars_lf = prepare_pillars(
         store, inst_family, dates, binning, 
         min_time_to_expiry_hours=min_time_to_expiry_hours,
         unique_times=unique_times,
         drop_pillar_idx=drop_pillar_idx,
     )
     
-    if not snapshots:
-        return pl.LazyFrame()
+    df_pillars = pillars_lf.collect()
+    
+    if df_pillars.is_empty():
+        return pl.DataFrame().lazy()
     
     curves = []
     
-    for timeMs, pillars_df in snapshots.items():
+    for pillars_df in df_pillars.partition_by('timeMs', maintain_order=True):
         # Extract arrays from concatenated pillars
         data = _extract_pillar_arrays(pillars_df)
+        if len(data['T']) < 2:
+            continue
         
         # Fit PCHIP curve (data already has log prices from prepare_pillars)
         curve = fit_pchip_curve(
@@ -243,12 +233,12 @@ def build_forwards_pchip(
             F_bid_pillars=data['ln_F_bid'],
             F_ask_pillars=data['ln_F_ask'],
             symbols=data['symbols'],
-            timeMs=int(timeMs),
+            timeMs=int(data['timeMs']),
         )
         curves.append(curve)
     
     if not curves:
-        return pl.LazyFrame()
+        return pl.DataFrame().lazy()
     
     # Apply time-aware EWMA smoothing
     smoothed_curves = ewma_smooth(curves, tau_minutes=tau_ewma_minutes)
@@ -295,24 +285,28 @@ def build_forwards_kalman(
                         futures DataFrame will be dropped before fitting.
     """
     if not dates:
-        return pl.LazyFrame()
+        return pl.DataFrame().lazy()
     
     # Prepare pillar data with timestamp matching
-    snapshots_dict = prepare_pillars(
+    pillars_lf = prepare_pillars(
         store, inst_family, dates, binning,
         min_time_to_expiry_hours=min_time_to_expiry_hours,
         unique_times=unique_times,
         drop_pillar_idx=drop_pillar_idx,
     )
     
-    if not snapshots_dict:
-        return pl.LazyFrame()
+    df_pillars = pillars_lf.collect()
+    
+    if df_pillars.is_empty():
+        return pl.DataFrame().lazy()
     
     snapshots = []
     
-    for timeMs, pillars_df in snapshots_dict.items():
+    for pillars_df in df_pillars.partition_by('timeMs', maintain_order=True):
         # Extract arrays from concatenated pillars
         data = _extract_pillar_arrays(pillars_df)
+        if len(data['T']) < 2:
+            continue
         
         # Create snapshot dict for kalman_filter
         snapshot = {
@@ -325,7 +319,7 @@ def build_forwards_kalman(
         snapshots.append(snapshot)
     
     if not snapshots:
-        return pl.LazyFrame()
+        return pl.DataFrame().lazy()
     
     # Apply time-aware Kalman filter (now expects log prices)
     states = kalman_filter(

@@ -462,10 +462,21 @@ def loeo_error(
     binning = recipe_kwargs.get('binning', '5m')
     min_time_to_expiry_hours = recipe_kwargs.get('min_time_to_expiry_hours', 2.0)
     unique_times = recipe_kwargs.get('unique_times', None)
-    cache_name_suffix = recipe_kwargs.get('cache_name_suffix', '_pillars')
+    cache_name_suffix = recipe_kwargs.get('cache_name_suffix', 'pillars')
+
+    # Determine recipe type for reconstruction
+    from functools import partial
+    recipe_callable = forwards_recipe.func if isinstance(forwards_recipe, partial) else forwards_recipe
+    recipe_name = recipe_callable.__name__.lower()
+    if 'pchip' in recipe_name:
+        recipe_kind = 'pchip'
+    elif 'kalman' in recipe_name:
+        recipe_kind = 'kalman'
+    else:
+        raise ValueError(f"Unsupported forwards recipe for LOEO evaluation: {recipe_callable.__name__}")
     
     # Get reference snapshots to determine number of pillars at each time
-    snapshots_ref = prepare_pillars(
+    pillars_lf = prepare_pillars(
         store, inst_family, dates, binning,
         min_time_to_expiry_hours=min_time_to_expiry_hours,
         unique_times=unique_times,
@@ -473,23 +484,29 @@ def loeo_error(
         drop_pillar_idx=None,
     )
     
-    if not snapshots_ref:
+    df_pillars = pillars_lf.collect()
+    
+    if df_pillars.is_empty():
         return pl.DataFrame()
     
     results = []
     
     # For each snapshot, determine the number of pillars
-    for timeMs, pillars_df in snapshots_ref.items():
+    for pillars_df in df_pillars.partition_by('timeMs', maintain_order=True):
+        timeMs = int(pillars_df['timeMs'][0])
         n_pillars = len(pillars_df)
+
+        if n_pillars <= 1:
+            continue
         
         # Skip SWAP (idx 0) since it's the anchor
         for pillar_idx in range(1, n_pillars):
             # Get observed data for this pillar
-            pillar_row = pillars_df[pillar_idx]
-            symbol_held_out = pillar_row['symbol'][0]
-            T_held_out = pillar_row['T'][0]
-            F_bid_obs = np.exp(pillar_row['ln_bid_1_px'][0])
-            F_ask_obs = np.exp(pillar_row['ln_ask_1_px'][0])
+            row = pillars_df.row(pillar_idx, named=True)
+            symbol_held_out = row['symbol']
+            T_held_out = row['T']
+            F_bid_obs = np.exp(row['ln_bid_1_px'])
+            F_ask_obs = np.exp(row['ln_ask_1_px'])
             
             try:
                 # Build curve with this pillar dropped
@@ -522,19 +539,22 @@ def loeo_error(
                 
                 # Reconstruct forward at held-out maturity using interpolation
                 # Import PCHIPCurve for reconstruction
-                from forwards.pchip import PCHIPCurve, reconstruct_forward
-                
-                # Create PCHIPCurve object from the fitted data
-                curve = PCHIPCurve(
-                    timeMs=timeMs,
-                    T_nodes=df_curve['T'].to_numpy(),
-                    ln_F_bid_nodes=np.log(df_curve['F_bid'].to_numpy()),
-                    ln_F_ask_nodes=np.log(df_curve['F_ask'].to_numpy()),
-                    symbols=df_curve['symbol'].to_list(),
-                )
-                
-                # Reconstruct at held-out maturity
-                F_bid_pred, F_ask_pred = reconstruct_forward(curve, T_held_out)
+                if recipe_kind == 'pchip':
+                    from forwards.pchip import PCHIPCurve, reconstruct_forward
+                    
+                    curve = PCHIPCurve(
+                        timeMs=timeMs,
+                        T_nodes=df_curve['T'].to_numpy(),
+                        ln_F_bid_nodes=df_curve['ln_F_bid'].to_numpy(),
+                        ln_F_ask_nodes=df_curve['ln_F_ask'].to_numpy(),
+                        symbols=df_curve['symbol'].to_list(),
+                    )
+                    F_bid_pred, F_ask_pred = reconstruct_forward(curve, T_held_out)
+                else:
+                    from forwards.kalman_ns import NSCarryState, reconstruct_ns_forward
+                    state = NSCarryState.from_polars(df_curve)
+                    F_bid_pred = reconstruct_ns_forward(state, T_held_out, use_bid=True)
+                    F_ask_pred = reconstruct_ns_forward(state, T_held_out, use_bid=False)
                 
                 # Compute errors in bps
                 error_bid_bps = np.abs(np.log(F_bid_pred) - np.log(F_bid_obs)) * 10000
@@ -574,4 +594,3 @@ def loeo_error(
                 })
     
     return pl.DataFrame(results)
-

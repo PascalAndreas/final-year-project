@@ -314,6 +314,7 @@ class OrderbookStore:
             'exp': lambda lf: (exp_prices(lf), True),
             'strip': lambda lf: (strip_ob(lf), True),
             'parse_option': lambda lf: (parse_option(lf), True),
+            'dedupe': lambda lf: (lf.unique(maintain_order=True), True),
         }
         
         # Process features list in order

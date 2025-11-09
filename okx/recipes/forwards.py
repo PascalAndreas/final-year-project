@@ -105,13 +105,18 @@ def prepare_pillars(
         .filter(pl.col('ln_bid_1_px').is_not_null())
     )
 
-    lf_valid_times = lf_swap_snapshots.select('timeMs').unique()
+    lf_valid_times = (
+        lf_swap_snapshots.select('timeMs')
+        .unique()
+        .sort('timeMs')
+    )
 
     # Align each futures symbol independently using cross join + asof
     lf_symbol_times = (
         lf_futures.select('symbol')
         .unique()
         .join(lf_valid_times, how='cross')
+        .sort(['symbol', 'timeMs'])
     )
     lf_futures_snapshots = (
         lf_symbol_times.join_asof(
@@ -126,10 +131,10 @@ def prepare_pillars(
         .filter(pl.col('expiry') > pl.col('timeMs'))
     )
 
-    # Ensure consistent column order before concat
+    # Ensure consistent column order before concat (LazyFrames don't have .columns)
     common_cols = ['timeMs', 'symbol', 'rel_spread', 'expiry', 'T', 
-                   'ln_bid_1_px', 'ln_ask_1_px', 'ln_spread']
-    
+                   'ln_bid_1_px', 'ln_ask_1_px']
+
     pillars = pl.concat([
         lf_swap_snapshots.select(common_cols),
         lf_futures_snapshots.select(common_cols),

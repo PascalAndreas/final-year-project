@@ -121,33 +121,29 @@ def parse_option(lf: pl.LazyFrame) -> pl.LazyFrame:
         - opt_type: 'C' for call, 'P' for put
     
     Note: Does NOT add moneyness (requires spot reference from separate data source).
+    
+    Symbol format: BTC-USD-250627-200000-C (currency-date-strike-type)
     """
-    df = lf.collect()
-    
-    if df.is_empty():
-        return lf
-    
-    # Parse strike and option type from symbols
-    def extract_strike(symbol: str):
-        try:
-            _, _, strike, _ = parse_option_name(symbol)
-            return strike
-        except:
-            return None
-    
-    def extract_opt_type(symbol: str):
-        try:
-            _, _, _, opt_type = parse_option_name(symbol)
-            return opt_type
-        except:
-            return None
-    
-    df = df.with_columns([
-        pl.col('symbol').map_elements(extract_strike, return_dtype=pl.Int64).alias('strike'),
-        pl.col('symbol').map_elements(extract_opt_type, return_dtype=pl.String).alias('opt_type'),
+    # Remove file extension if present (e.g., '.OK') and split by '-'
+    # Using vectorized string operations - much faster than map_elements
+    return lf.with_columns([
+        # Extract strike (4th element after split, index 3)
+        pl.col('symbol')
+          .str.split('.')
+          .list.first()  # Remove extension
+          .str.split('-')
+          .list.get(3)
+          .cast(pl.Int64)
+          .alias('strike'),
+        # Extract option type (5th element after split, index 4)
+        pl.col('symbol')
+          .str.split('.')
+          .list.first()
+          .str.split('-')
+          .list.get(4)
+          .str.to_uppercase()
+          .alias('opt_type'),
     ])
-    
-    return df.lazy()
 
 def add_tenor(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
     """
@@ -155,30 +151,38 @@ def add_tenor(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
     
     For FUTURES/OPTION: parses expiry from symbol
     For SWAP: sets expiry = timeMs (making T = 0)
-    """
-    df = lf.collect()
-    if df.is_empty():
-        return lf
     
+    Symbol formats:
+    - FUTURES: BTC-USD-250131 (date is 3rd element)
+    - OPTION: BTC-USD-250627-200000-C (date is 3rd element)
+    """
     # Parse expiry based on instrument type (as milliseconds)
-    if inst_type == 'FUTURES':
-        expiry_ms = df['symbol'].map_elements(
-            lambda s: int(parse_future_name(s)[1].timestamp() * 1000), 
-            return_dtype=pl.Int64
-        )
-    elif inst_type == 'OPTION':
-        expiry_ms = df['symbol'].map_elements(
-            lambda s: int(parse_option_name(s)[1].timestamp() * 1000), 
-            return_dtype=pl.Int64
-        )
-    elif inst_type == 'SWAP':
+    # Using vectorized string operations - much faster than map_elements
+    if inst_type == 'SWAP':
         # Set expiry = timeMs so that T = 0 for perpetual swaps
         expiry_ms = pl.col('timeMs')
+    elif inst_type in ['FUTURES', 'OPTION']:
+        # Extract date string (3rd element, index 2) and parse
+        # Format is YYMMDD, expiry at 08:00 UTC
+        date_str = (pl.col('symbol')
+                    .str.split('.')
+                    .list.first()  # Remove extension if present
+                    .str.split('-')
+                    .list.get(2))  # Get date part (YYMMDD)
+        
+        # Parse YYMMDD to datetime at 08:00 UTC, then convert to milliseconds
+        # strptime format: %y%m%d
+        expiry_ms = (date_str
+                     .str.strptime(pl.Datetime('us'), '%y%m%d')
+                     .dt.replace_time_zone('UTC')
+                     .dt.offset_by('8h')  # Add 8 hours for 08:00 UTC expiry
+                     .dt.timestamp('ms'))
     else:
-        return df.lazy()
+        # Unknown instrument type, return unchanged
+        return lf
     
     # Add expiry (ms) and T columns. ACT/365F convention.
-    return df.with_columns([
+    return lf.with_columns([
         expiry_ms.alias('expiry'),
         ((expiry_ms - pl.col('timeMs')) / 1000.0 / (365 * 24 * 3600)).alias('T')
-    ]).lazy()
+    ])

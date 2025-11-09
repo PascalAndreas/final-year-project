@@ -38,20 +38,12 @@ def _get_recipe_name(recipe: Callable) -> str:
         return recipe.func.__name__
     return recipe.__name__
 
-
 def _reconstruct_forward_pchip(df_curve: pl.DataFrame, T_target: float | np.ndarray) -> tuple[float | np.ndarray, float | np.ndarray]:
     """Reconstruct forward from PCHIP curve."""
     from forwards.pchip import PCHIPCurve, reconstruct_forward
     
-    curve = PCHIPCurve(
-        timeMs=int(df_curve['timeMs'][0]),
-        T_nodes=df_curve['T'].to_numpy(),
-        ln_F_bid_nodes=np.log(df_curve['F_bid'].to_numpy()),
-        ln_F_ask_nodes=np.log(df_curve['F_ask'].to_numpy()),
-        symbols=df_curve['symbol'].to_list(),
-    )
+    curve = PCHIPCurve.from_polars(df_curve)
     return reconstruct_forward(curve, T_target)
-
 
 def _reconstruct_forward_kalman(df_curve: pl.DataFrame, T_target: float | np.ndarray) -> tuple[float | np.ndarray, float | np.ndarray]:
     """Reconstruct forward from Kalman NS state."""
@@ -62,9 +54,9 @@ def _reconstruct_forward_kalman(df_curve: pl.DataFrame, T_target: float | np.nda
     F_ask = reconstruct_ns_forward(state, T_target, use_bid=False)
     return F_bid, F_ask
 
-
-def _get_reconstruct_fn(recipe_name: str) -> Callable:
+def _get_reconstruct_fn(forwards_recipe: Callable) -> Callable:
     """Get the appropriate reconstruction function based on recipe name."""
+    recipe_name = _get_recipe_name(forwards_recipe)
     if 'pchip' in recipe_name.lower():
         return _reconstruct_forward_pchip
     elif 'kalman' in recipe_name.lower():
@@ -72,6 +64,34 @@ def _get_reconstruct_fn(recipe_name: str) -> Callable:
     else:
         raise ValueError(f"Unknown recipe type: {recipe_name}")
 
+def _format_cache_value(value) -> str:
+    """Format parameter value for cache name (e.g., 5.0 -> '5.0', '5m' -> '5m')."""
+    if isinstance(value, float):
+        # Format floats to remove trailing zeros
+        return f"{value:.10g}"
+    elif isinstance(value, (int, str)):
+        return str(value)
+    elif value is None:
+        return "None"
+    else:
+        # For other types, use simple string representation
+        return str(value).replace(" ", "")
+
+def _build_cache_name(forwards_recipe: Callable, binning: Optional[str] = None) -> str:
+    """Build cache name like '{binning|full}_{param1=val1_}forwards' for forwards recipe."""
+    if isinstance(forwards_recipe, partial):
+        recipe_name = _get_recipe_name(forwards_recipe)
+        params = forwards_recipe.keywords or {}
+        param_parts = [
+            f"{key}={_format_cache_value(params[key])}"
+            for key in sorted(params)
+        ]
+        params_str = "_".join(param_parts) + ("_" if param_parts else "")
+    else:
+        recipe_name = _get_recipe_name(forwards_recipe)
+        params_str = ""
+    prefix = binning if binning is not None else "full"
+    return f"{prefix}_{params_str}forwards"
 
 # =============================================================================
 # Options data preparation
@@ -123,10 +143,12 @@ def prepare_options(
     options_features = ['trim', 'strip']
     if binning:
         options_features.extend(['bin', finalize_binning])
+    else:
+        options_features.extend(['dedupe'])
     options_features.extend(['tenor', early_roll(min_time_to_expiry_hours), 'parse_option'])
     
     # Load options orderbook
-    lf_options = store.get(
+    df_options = store.get(
         inst_type='OPTION',
         inst_family=inst_family,
         dates=dates,
@@ -134,18 +156,8 @@ def prepare_options(
         binning=binning,
         features=options_features,
         cache_name=cache_name,
-    )
-    
-    df_options = lf_options.collect()
-    
-    if df_options.is_empty():
-        return pl.DataFrame()
-    
-    # Filter out failed parses (null strike or opt_type)
-    df_options = df_options.filter(
-        pl.col('strike').is_not_null() & pl.col('opt_type').is_not_null()
-    )
-    
+    ).collect()
+
     if df_options.is_empty():
         return pl.DataFrame()
     
@@ -153,34 +165,19 @@ def prepare_options(
     # Build forward curves and add to options
     # =========================================================================
     
-    recipe_name = _get_recipe_name(forwards_recipe)
-    
-    # Extract parameters from the partial to build cache name
-    if isinstance(forwards_recipe, partial):
-        # Build cache name from the partial's keywords
-        params = forwards_recipe.keywords
-        cache_parts = [recipe_name]
-        if 'binning' in params and params['binning']:
-            cache_parts.insert(0, params['binning'])
-        if 'tau_ewma_minutes' in params:
-            cache_parts.append(f"tau{params['tau_ewma_minutes']:.1f}")
-        if 'lambda_ns' in params:
-            cache_parts.append(f"lambda{params['lambda_ns']:.1f}")
-        forwards_cache_name = "_".join(cache_parts)
-    else:
-        forwards_cache_name = recipe_name
+    cache_name = _build_cache_name(forwards_recipe, binning)
     
     # Get reconstruction function based on recipe type
-    reconstruct_fn = _get_reconstruct_fn(recipe_name)
+    reconstruct_fn = _get_reconstruct_fn(forwards_recipe)
     
-    # Build forward curves using get_derived for caching
-    recipe_for_derivation = forwards_recipe
-    # If no binning, add unique_times to the recipe via another partial
+    # Handle unique_times for unbinned data, otherwise pass binning to recipe
     if binning is None:
         unique_times = df_options['timeMs'].unique().sort().to_list()
-        recipe_for_derivation = partial(recipe_for_derivation, unique_times=unique_times)
+        recipe_for_derivation = partial(forwards_recipe, unique_times=unique_times)
+    else:
+        recipe_for_derivation = partial(forwards_recipe, binning=binning)
     
-    lf_forwards = store.get_derived(recipe_for_derivation, dates=dates, cache_name=forwards_cache_name)
+    lf_forwards = store.get_derived(recipe_for_derivation, dates=dates, cache_name=cache_name)
     df_forwards = lf_forwards.collect()
     
     if df_forwards.is_empty():
@@ -188,25 +185,30 @@ def prepare_options(
     
     # Add forward prices to each option row
     results = []
-    df_forwards_sorted = df_forwards.sort(['timeMs', 'T']) if 'T' in df_forwards.columns else df_forwards
     
-    for timeMs in df_options['timeMs'].unique().to_list():
+    for timeMs in df_options['timeMs'].unique().sort().to_list():
         # Get curve for this timestamp
-        df_curve = df_forwards_sorted.filter(pl.col('timeMs') == timeMs)
-        
+        df_curve = df_forwards.filter(pl.col('timeMs') == timeMs)
         if df_curve.is_empty():
             continue
         
         # Get all options at this timestamp
         options_at_time = df_options.filter(pl.col('timeMs') == timeMs)
         
-        # Extract T values for vectorized forward reconstruction
+        # Optimize: Many options share same T (expiry) but differ in strike/type
+        # Only reconstruct forwards for unique T values, then map back
         T_values = options_at_time['T'].to_numpy()
+        unique_T, inverse_indices = np.unique(T_values, return_inverse=True)
         
         try:
-            # Reconstruct forwards for all T values at once
-            F_fitted_bids, F_fitted_asks = reconstruct_fn(df_curve, T_values)
-            F_fitted_mids = (F_fitted_bids + F_fitted_asks) / 2
+            # Reconstruct forwards only for unique T values
+            F_fitted_bids_unique, F_fitted_asks_unique = reconstruct_fn(df_curve, unique_T)
+            F_fitted_mids_unique = (F_fitted_bids_unique + F_fitted_asks_unique) / 2
+            
+            # Map unique results back to all options using inverse indices
+            F_fitted_bids = F_fitted_bids_unique[inverse_indices]
+            F_fitted_asks = F_fitted_asks_unique[inverse_indices]
+            F_fitted_mids = F_fitted_mids_unique[inverse_indices]
             
             # Add forward prices and moneyness to options
             options_with_forwards = options_at_time.with_columns([

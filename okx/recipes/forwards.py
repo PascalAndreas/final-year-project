@@ -265,10 +265,12 @@ def build_forwards_pchip(
     print(f"Time taken to fit curves: {time_2 - time_1}")
     # Apply time-aware EWMA smoothing
     smoothed_curves = ewma_smooth(curves, tau_minutes=tau_ewma_minutes)
-    
+    time_3 = datetime.now()
+    print(f"Time taken to smooth curves: {time_3 - time_2}")
     # Convert to Polars
     df_result = curves_to_polars(smoothed_curves)
-    
+    time_4 = datetime.now()
+    print(f"Time taken to convert to Polars: {time_4 - time_3}")
     return df_result.lazy()
 
 
@@ -307,6 +309,7 @@ def build_forwards_kalman(
                         If provided, the pillar at this index in the sorted
                         futures DataFrame will be dropped before fitting.
     """
+    start_time = datetime.now()
     if not dates:
         return pl.DataFrame().lazy()
     
@@ -323,7 +326,11 @@ def build_forwards_kalman(
     if df_pillars.is_empty():
         return pl.DataFrame().lazy()
     
+    time_1 = datetime.now()
+    print(f"Time taken to prepare pillars: {time_1 - start_time}")
+
     snapshots = []
+    snapshot_start = datetime.now()
     
     for pillars_df in df_pillars.partition_by('timeMs', maintain_order=True):
         # Extract arrays from concatenated pillars
@@ -341,9 +348,14 @@ def build_forwards_kalman(
         }
         snapshots.append(snapshot)
     
+    snapshot_end = datetime.now()
+    print(f"Time taken to build snapshots: {snapshot_end - snapshot_start} "
+          f"({len(snapshots):,} usable timestamps)")
+
     if not snapshots:
         return pl.DataFrame().lazy()
     
+    filter_start = datetime.now()
     # Apply time-aware Kalman filter (now expects log prices)
     states = kalman_filter(
         snapshots=snapshots,
@@ -352,8 +364,13 @@ def build_forwards_kalman(
         sigma_per_sqrt_day=sigma_per_sqrt_day,
         kappa_spread=kappa_spread,
     )
-    
+    filter_end = datetime.now()
+    print(f"Time taken to run Kalman filter: {filter_end - filter_start}")
+
+    convert_start = datetime.now()
     # Convert to Polars
     df_result = states_to_polars(states)
-    
+    convert_end = datetime.now()
+    print(f"Time taken to convert states: {convert_end - convert_start}")
+
     return df_result.lazy()

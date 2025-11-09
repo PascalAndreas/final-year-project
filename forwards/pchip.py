@@ -54,31 +54,33 @@ class PCHIPCurve:
         if df.is_empty():
             raise ValueError("Cannot create PCHIPCurve from empty DataFrame")
         
-        # Get unique timestamps
-        unique_times = df['timeMs'].unique().sort().to_list()
-        
-        if len(unique_times) == 1:
-            # Single curve
-            return cls(
-                timeMs=int(df['timeMs'][0]),
-                T_nodes=df['T'].to_numpy(),
-                ln_F_bid_nodes=df['ln_F_bid'].to_numpy(),
-                ln_F_ask_nodes=df['ln_F_ask'].to_numpy(),
-                symbols=df['symbol'].to_list(),
-            )
-        else:
-            # Multiple curves
-            curves = []
-            for t in unique_times:
-                df_t = df.filter(pl.col('timeMs') == t)
-                curves.append(cls(
-                    timeMs=int(t),
-                    T_nodes=df_t['T'].to_numpy(),
-                    ln_F_bid_nodes=df_t['ln_F_bid'].to_numpy(),
-                    ln_F_ask_nodes=df_t['ln_F_ask'].to_numpy(),
-                    symbols=df_t['symbol'].to_list(),
-                ))
-            return curves
+        df_sorted = df.sort(['timeMs', 'T'])
+        time_values = df_sorted['timeMs'].to_numpy()
+        T_values = df_sorted['T'].to_numpy()
+        ln_bid_values = df_sorted['ln_F_bid'].to_numpy()
+        ln_ask_values = df_sorted['ln_F_ask'].to_numpy()
+        symbols = df_sorted['symbol'].to_list()
+
+        if len(time_values) == 0:
+            raise ValueError("Cannot create PCHIPCurve from empty DataFrame")
+
+        change_points = np.flatnonzero(np.diff(time_values)) + 1 if len(time_values) > 1 else np.array([], dtype=int)
+        start_indices = np.concatenate(([0], change_points))
+        end_indices = np.concatenate((change_points, [len(time_values)]))
+
+        curves: list[PCHIPCurve] = []
+        for start_idx, end_idx in zip(start_indices, end_indices):
+            curves.append(cls(
+                timeMs=int(time_values[start_idx]),
+                T_nodes=T_values[start_idx:end_idx],
+                ln_F_bid_nodes=ln_bid_values[start_idx:end_idx],
+                ln_F_ask_nodes=ln_ask_values[start_idx:end_idx],
+                symbols=symbols[start_idx:end_idx],
+            ))
+
+        if len(curves) == 1:
+            return curves[0]
+        return curves
     
     def to_polars(self) -> pl.DataFrame:
         """Convert to Polars DataFrame for storage."""

@@ -27,6 +27,8 @@ from functools import partial
 
 from okx.recipes.helpers import early_roll, finalize_binning
 
+from datetime import datetime
+from tqdm import tqdm
 
 # =============================================================================
 # Helper functions
@@ -104,6 +106,7 @@ def prepare_options(
     forwards_recipe: Callable,
     binning: Optional[str] = None,
     min_time_to_expiry_hours: float = 2.0,
+    verbose: bool = True,
 ) -> pl.DataFrame:
     """
     Prepare options data with metadata and fitted forward prices.
@@ -123,7 +126,7 @@ def prepare_options(
         forwards_recipe: Pre-configured recipe function (use functools.partial)
         binning: Binning interval ('1m', '5m', etc) or None for unbinned
         min_time_to_expiry_hours: Minimum time to expiry (default: 2.0)
-        
+        verbose: Whether to print progress (default: True)
     Returns:
         DataFrame with columns:
             - timeMs, symbol, expiry, T
@@ -132,7 +135,7 @@ def prepare_options(
             - F_fitted_bid, F_fitted_ask (from forward curve)
             - moneyness (strike / F_fitted_mid)
     """
-    
+    start_time = datetime.now()
     # =============================================================================
     # Fetch options orderbook
     # =============================================================================
@@ -161,6 +164,8 @@ def prepare_options(
     if df_options.is_empty():
         return pl.DataFrame()
     
+    time_1 = datetime.now()
+    print(f"Time taken to fetch options: {time_1 - start_time}")
     # =========================================================================
     # Build forward curves and add to options
     # =========================================================================
@@ -183,10 +188,16 @@ def prepare_options(
     if df_forwards.is_empty():
         return pl.DataFrame()
     
+    time_2 = datetime.now()
+    print(f"Time taken to fetch forwards: {time_2 - time_1}")
+
     # Add forward prices to each option row
     results = []
-    
-    for timeMs in df_options['timeMs'].unique().sort().to_list():
+
+    timeMs_list = df_options['timeMs'].unique().sort().to_list()
+    timeMs_iter = tqdm(timeMs_list, desc="Matching forwards to options", disable=not verbose)
+
+    for timeMs in timeMs_iter:
         # Get curve for this timestamp
         df_curve = df_forwards.filter(pl.col('timeMs') == timeMs)
         if df_curve.is_empty():
@@ -227,6 +238,9 @@ def prepare_options(
     
     if not results:
         return pl.DataFrame()
+    
+    time_3 = datetime.now()
+    print(f"Time taken to add forwards to options: {time_3 - time_2}")
     
     return pl.concat(results)
 

@@ -286,6 +286,24 @@ def curves_to_polars(curves: list[PCHIPCurve]) -> pl.DataFrame:
     if not curves:
         return pl.DataFrame()
     
-    dfs = [curve.to_polars() for curve in curves]
-    return pl.concat(dfs)
+    time_chunks = []
+    T_chunks = []
+    ln_bid_chunks = []
+    ln_ask_chunks = []
+    symbol_list: list[str] = []
 
+    for curve in curves:
+        n_nodes = len(curve.T_nodes)
+        time_chunks.append(np.full(n_nodes, curve.timeMs, dtype=np.int64))
+        T_chunks.append(curve.T_nodes)
+        ln_bid_chunks.append(curve.ln_F_bid_nodes)
+        ln_ask_chunks.append(curve.ln_F_ask_nodes)
+        symbol_list.extend(curve.symbols)
+
+    return pl.DataFrame({
+        "timeMs": np.concatenate(time_chunks),
+        "T": np.concatenate(T_chunks),
+        "ln_F_bid": np.concatenate(ln_bid_chunks),
+        "ln_F_ask": np.concatenate(ln_ask_chunks),
+        "symbol": symbol_list,
+    })

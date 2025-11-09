@@ -208,6 +208,7 @@ def build_forwards_pchip(
                         If provided, the pillar at this index in the sorted
                         futures DataFrame will be dropped before fitting.
     """
+    start_time = datetime.now()
     if not dates:
         return pl.DataFrame().lazy()
     
@@ -224,27 +225,44 @@ def build_forwards_pchip(
     if df_pillars.is_empty():
         return pl.DataFrame().lazy()
     
+    time_1 = datetime.now()
+    print(f"Time taken to prepare pillars: {time_1 - start_time}")
+
+    # Convert once to NumPy arrays/lists to avoid per-group DataFrame materialization
+    df_pillars = df_pillars.sort(['timeMs', 'T'])
+    time_values = df_pillars['timeMs'].to_numpy()
+    T_values = df_pillars['T'].to_numpy()
+    ln_bid_values = df_pillars['ln_bid_1_px'].to_numpy()
+    ln_ask_values = df_pillars['ln_ask_1_px'].to_numpy()
+    symbol_values = df_pillars['symbol'].to_list()
+
+    if len(time_values) == 0:
+        return pl.DataFrame().lazy()
+
+    # Find contiguous blocks of identical timeMs without creating per-time DataFrames
+    change_points = np.flatnonzero(np.diff(time_values)) + 1 if len(time_values) > 1 else np.array([], dtype=int)
+    start_indices = np.concatenate(([0], change_points))
+    end_indices = np.concatenate((change_points, [len(time_values)]))
+
     curves = []
-    
-    for pillars_df in df_pillars.partition_by('timeMs', maintain_order=True):
-        # Extract arrays from concatenated pillars
-        data = _extract_pillar_arrays(pillars_df)
-        if len(data['T']) < 2:
+    for start_idx, end_idx in zip(start_indices, end_indices):
+        if end_idx - start_idx < 2:
             continue
-        
-        # Fit PCHIP curve (data already has log prices from prepare_pillars)
+
         curve = fit_pchip_curve(
-            T_pillars=data['T'],
-            F_bid_pillars=data['ln_F_bid'],
-            F_ask_pillars=data['ln_F_ask'],
-            symbols=data['symbols'],
-            timeMs=int(data['timeMs']),
+            T_pillars=T_values[start_idx:end_idx],
+            F_bid_pillars=ln_bid_values[start_idx:end_idx],
+            F_ask_pillars=ln_ask_values[start_idx:end_idx],
+            symbols=symbol_values[start_idx:end_idx],
+            timeMs=int(time_values[start_idx]),
         )
         curves.append(curve)
     
     if not curves:
         return pl.DataFrame().lazy()
     
+    time_2 = datetime.now()
+    print(f"Time taken to fit curves: {time_2 - time_1}")
     # Apply time-aware EWMA smoothing
     smoothed_curves = ewma_smooth(curves, tau_minutes=tau_ewma_minutes)
     

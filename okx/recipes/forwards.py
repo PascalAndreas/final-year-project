@@ -34,6 +34,7 @@ def prepare_pillars(
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
     cache_name_suffix: str = "pillars",
+    verbose: bool = False,
 ) -> pl.LazyFrame:
     """
     Prepare concatenated pillar data from SWAP and FUTURES orderbooks.
@@ -188,6 +189,7 @@ def build_forwards_pchip(
     min_time_to_expiry_hours: float = 2.0,
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
+    verbose: bool = False,
 ) -> pl.LazyFrame:
     """
     Build forward curve using PCHIP interpolation with time-aware EWMA smoothing.
@@ -226,7 +228,8 @@ def build_forwards_pchip(
         return pl.DataFrame().lazy()
     
     time_1 = datetime.now()
-    print(f"Time taken to prepare pillars: {time_1 - start_time}")
+    if verbose:
+        print(f"Time taken to prepare pillars: {time_1 - start_time}")
 
     # Convert once to NumPy arrays/lists to avoid per-group DataFrame materialization
     df_pillars = df_pillars.sort(['timeMs', 'T'])
@@ -262,15 +265,18 @@ def build_forwards_pchip(
         return pl.DataFrame().lazy()
     
     time_2 = datetime.now()
-    print(f"Time taken to fit curves: {time_2 - time_1}")
+    if verbose:
+        print(f"Time taken to fit curves: {time_2 - time_1}")
     # Apply time-aware EWMA smoothing
     smoothed_curves = ewma_smooth(curves, tau_minutes=tau_ewma_minutes)
     time_3 = datetime.now()
-    print(f"Time taken to smooth curves: {time_3 - time_2}")
+    if verbose:
+        print(f"Time taken to smooth curves: {time_3 - time_2}")
     # Convert to Polars
     df_result = curves_to_polars(smoothed_curves)
     time_4 = datetime.now()
-    print(f"Time taken to convert to Polars: {time_4 - time_3}")
+    if verbose:
+        print(f"Time taken to convert to Polars: {time_4 - time_3}")
     return df_result.lazy()
 
 
@@ -286,6 +292,7 @@ def build_forwards_kalman(
     kappa_spread: float = 0.5,
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
+    verbose: bool = False,
 ) -> pl.LazyFrame:
     """
     Build forward curve using time-aware Kalman-filtered Nelson-Siegel carry model.
@@ -327,7 +334,8 @@ def build_forwards_kalman(
         return pl.DataFrame().lazy()
     
     time_1 = datetime.now()
-    print(f"Time taken to prepare pillars: {time_1 - start_time}")
+    if verbose:
+        print(f"Time taken to prepare pillars: {time_1 - start_time}")
 
     snapshots = []
     snapshot_start = datetime.now()
@@ -349,8 +357,11 @@ def build_forwards_kalman(
         snapshots.append(snapshot)
     
     snapshot_end = datetime.now()
-    print(f"Time taken to build snapshots: {snapshot_end - snapshot_start} "
-          f"({len(snapshots):,} usable timestamps)")
+    if verbose:
+        print(
+            f"Time taken to build snapshots: {snapshot_end - snapshot_start} "
+            f"({len(snapshots):,} usable timestamps)"
+        )
 
     if not snapshots:
         return pl.DataFrame().lazy()
@@ -363,14 +374,17 @@ def build_forwards_kalman(
         tau_minutes=tau_minutes,
         sigma_per_sqrt_day=sigma_per_sqrt_day,
         kappa_spread=kappa_spread,
+        progress=verbose,
     )
     filter_end = datetime.now()
-    print(f"Time taken to run Kalman filter: {filter_end - filter_start}")
+    if verbose:
+        print(f"Time taken to run Kalman filter: {filter_end - filter_start}")
 
     convert_start = datetime.now()
     # Convert to Polars
     df_result = states_to_polars(states)
     convert_end = datetime.now()
-    print(f"Time taken to convert states: {convert_end - convert_start}")
+    if verbose:
+        print(f"Time taken to convert states: {convert_end - convert_start}")
 
     return df_result.lazy()

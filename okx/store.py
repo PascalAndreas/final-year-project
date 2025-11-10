@@ -37,6 +37,21 @@ FEATURES = {
     "ask_volume": sum(pl.col(f"ask_{i}_qty") for i in range(1, 6)),
 }
 
+# Transformations that must be executed immediately (cannot sit in the FEATURES expr bucket)
+# because they either depend on runtime config (depth/binning), mutate the schema, or require
+# maintaining ordering/uniqueness guarantees.
+def _build_flush_features(depth: Optional[int], binning: Optional[str], inst_type: str):
+    return {
+        'trim': (lambda lf: (trim_ob(lf, depth), True)) if depth is not None else (lambda lf: (lf, False)),
+        'bin': (lambda lf: (bin_ob(lf, binning), True)) if binning is not None else (lambda lf: (lf, False)),
+        'tenor': lambda lf: (add_tenor(lf, inst_type), True),
+        'log': lambda lf: (log_prices(lf), True),
+        'exp': lambda lf: (exp_prices(lf), True),
+        'strip': lambda lf: (strip_ob(lf), True),
+        'parse_option': lambda lf: (parse_option(lf), True),
+        'dedupe': lambda lf: (lf.unique(maintain_order=True), True),
+    }
+
 # =============================================================================
 # Manifest
 # =============================================================================
@@ -280,7 +295,7 @@ class OrderbookStore:
 
     def _apply_transforms(self, lf: pl.LazyFrame, inst_family: str, inst_type: str,
                           depth: Optional[int], binning: Optional[str], 
-                          features: Optional[list]) -> pl.LazyFrame:
+                          features: Optional[list], verbose: bool = False) -> pl.LazyFrame:
         """
         Apply transformations in order specified by features list.
         
@@ -289,6 +304,13 @@ class OrderbookStore:
         """
         if lf.collect_schema() == {}:  # Empty LazyFrame
             return lf
+        
+        if verbose:
+            feature_summary = features if features else ['<default trim/bin>']
+            print(
+                f"[store] Applying transforms for {inst_family}/{inst_type} "
+                f"(depth={depth}, binning={binning}, features={feature_summary})"
+            )
         
         if not features:
             # No features: apply trim then bin
@@ -305,17 +327,7 @@ class OrderbookStore:
             return frame, []
         
         # Callable features that require flushing before execution
-        # Each returns (LazyFrame, was_applied: bool)
-        FLUSH_FEATURES = {
-            'trim': lambda lf: (trim_ob(lf, depth), True) if depth is not None else (lf, False),
-            'bin': lambda lf: (bin_ob(lf, binning), True) if binning is not None else (lf, False),
-            'tenor': lambda lf: (add_tenor(lf, inst_type), True),
-            'log': lambda lf: (log_prices(lf), True),
-            'exp': lambda lf: (exp_prices(lf), True),
-            'strip': lambda lf: (strip_ob(lf), True),
-            'parse_option': lambda lf: (parse_option(lf), True),
-            'dedupe': lambda lf: (lf.unique(maintain_order=True), True),
-        }
+        FLUSH_FEATURES = _build_flush_features(depth, binning, inst_type)
         
         # Process features list in order
         trim_applied = False
@@ -327,6 +339,8 @@ class OrderbookStore:
                 # Flush accumulated expressions, then apply the transformation
                 lf, feature_exprs = _flush(lf, feature_exprs)
                 lf, was_applied = FLUSH_FEATURES[feat](lf)
+                if verbose and was_applied:
+                    print(f"  - applied '{feat}'")
                 
                 # Track trim/bin application for default fallback
                 if feat == 'trim':
@@ -339,6 +353,8 @@ class OrderbookStore:
                     available = list(FEATURES.keys()) + list(FLUSH_FEATURES.keys())
                     raise ValueError(f"Unknown feature '{feat}'. Available: {available}")
                 feature_exprs.append(FEATURES[feat].alias(feat))
+                if verbose:
+                    print(f"  - applied '{feat}'")
             elif callable(feat):
                 lf, feature_exprs = _flush(lf, feature_exprs)
                 lf = feat(lf)
@@ -351,8 +367,12 @@ class OrderbookStore:
         # Apply trim/bin if not explicitly ordered
         if not trim_applied and depth is not None:
             lf = trim_ob(lf, depth)
+            if verbose:
+                print("  - applied default 'trim'")
         if not bin_applied and binning is not None:
             lf = bin_ob(lf, binning)
+            if verbose:
+                print("  - applied default 'bin'")
         
         return lf
 
@@ -371,8 +391,10 @@ class OrderbookStore:
         dates = self._date_range(start, end, dates)
         
         builder = lambda dates_to_build: self._apply_transforms(
-            self._scan_raw(inst_family, inst_type, dates_to_build), 
-            inst_family, inst_type, depth, binning, features
+            self._scan_raw(inst_family, inst_type, dates_to_build),
+            inst_family, inst_type,
+            depth, binning, features,
+            verbose=verbose,
         )
         return self._get(inst_family, inst_type, dates, builder, cache_name, verbose)
     
@@ -387,8 +409,7 @@ class OrderbookStore:
         Provide either (start, end) or dates. If cache_name provided, result is cached.
         """
         dates = self._date_range(start, end, dates)
-        
-        builder = lambda dates_to_build: recipe(self, dates_to_build)
+        builder = lambda dates_to_build: recipe(self, dates_to_build, verbose=verbose)
         return self._get('__derived__', '__derived__', dates, builder, cache_name, verbose)
     
     # =============================================================================

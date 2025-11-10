@@ -15,6 +15,7 @@ import numpy as np
 import polars as pl
 from typing import Tuple, Optional
 from dataclasses import dataclass
+from tqdm.auto import tqdm
 
 
 @dataclass
@@ -352,6 +353,7 @@ def kalman_filter(
     kappa_spread: float = 0.5,
     R_min: float = 1e-8,
     R_max: float = 1e-2,
+    progress: bool = False,
 ) -> list[NSCarryState]:
     """
     Apply time-aware Kalman filter to sequence of orderbook snapshots.
@@ -381,7 +383,13 @@ def kalman_filter(
     
     states = []
     
-    for snap in snapshots:
+    iterator = snapshots
+    progress_bar = None
+    if progress:
+        progress_bar = tqdm(snapshots, desc="Kalman filter")
+        iterator = progress_bar
+    
+    for snap in iterator:
         timeMs = snap['timeMs']
         T_pillars = snap['T']
         ln_F_bid_pillars = snap['ln_F_bid']
@@ -421,6 +429,8 @@ def kalman_filter(
         )
         states.append(state)
     
+    if progress_bar is not None:
+        progress_bar.close()
     return states
 
 
@@ -439,4 +449,3 @@ def states_to_polars(states: list[NSCarryState]) -> pl.DataFrame:
     
     dfs = [state.to_polars() for state in states]
     return pl.concat(dfs)
-

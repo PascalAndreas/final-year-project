@@ -10,7 +10,7 @@ Implements piecewise cubic Hermite interpolation on log-forwards with:
 import numpy as np
 import polars as pl
 from typing import Optional, Dict, Tuple
-from scipy.interpolate import PchipInterpolator
+from scipy.interpolate import pchip_interpolate
 from dataclasses import dataclass
 
 
@@ -149,17 +149,17 @@ def reconstruct_forward(
         >>> curve = fit_pchip_curve(...)
         >>> F_bid, F_ask = reconstruct_forward(curve, T_target=0.5)
     """
-    # Create PCHIP interpolators
-    pchip_bid = PchipInterpolator(curve.T_nodes, curve.ln_F_bid_nodes, extrapolate=True)
-    pchip_ask = PchipInterpolator(curve.T_nodes, curve.ln_F_ask_nodes, extrapolate=True)
+    T_target_arr = np.asarray(T_target, dtype=np.float64)
     
     # Interpolate in log-space, then exponentiate
-    ln_F_bid_target = pchip_bid(T_target)
-    ln_F_ask_target = pchip_ask(T_target)
+    ln_F_bid_target = pchip_interpolate(curve.T_nodes, curve.ln_F_bid_nodes, T_target_arr)
+    ln_F_ask_target = pchip_interpolate(curve.T_nodes, curve.ln_F_ask_nodes, T_target_arr)
     
     F_bid_target = np.exp(ln_F_bid_target)
     F_ask_target = np.exp(ln_F_ask_target)
     
+    if np.ndim(T_target_arr) == 0:
+        return float(F_bid_target), float(F_ask_target)
     return F_bid_target, F_ask_target
 
 

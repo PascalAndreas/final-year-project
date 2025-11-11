@@ -447,5 +447,20 @@ def states_to_polars(states: list[NSCarryState]) -> pl.DataFrame:
     if not states:
         return pl.DataFrame()
     
-    dfs = [state.to_polars() for state in states]
-    return pl.concat(dfs)
+    time_values = np.fromiter((state.timeMs for state in states), dtype=np.int64, count=len(states))
+    beta0_values = np.fromiter((state.beta0 for state in states), dtype=np.float64, count=len(states))
+    beta1_values = np.fromiter((state.beta1 for state in states), dtype=np.float64, count=len(states))
+    beta2_values = np.fromiter((state.beta2 for state in states), dtype=np.float64, count=len(states))
+    lambda_values = np.fromiter((state.lambda_ns for state in states), dtype=np.float64, count=len(states))
+    ref_bid_values = np.fromiter((state.ln_F_ref_bid for state in states), dtype=np.float64, count=len(states))
+    ref_ask_values = np.fromiter((state.ln_F_ref_ask for state in states), dtype=np.float64, count=len(states))
+    
+    return pl.DataFrame({
+        "timeMs": time_values,
+        "beta0": beta0_values,
+        "beta1": beta1_values,
+        "beta2": beta2_values,
+        "lambda_ns": lambda_values,
+        "ln_F_ref_bid": ref_bid_values,
+        "ln_F_ref_ask": ref_ask_values,
+    })

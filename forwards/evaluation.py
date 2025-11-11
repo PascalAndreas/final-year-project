@@ -9,10 +9,15 @@ Implements various metrics to assess:
 - Diagnostic quality checks
 """
 
+from datetime import date
+
 import numpy as np
 import polars as pl
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Optional, Dict, Any, Tuple
 from dataclasses import dataclass
+
+from forwards.data import load_matched_options
+from forwards.parity import compute_option_parity_table, summarize_option_parity
 
 
 @dataclass
@@ -268,6 +273,40 @@ def temporal_smoothness(
             })
     
     return pl.DataFrame(results)
+
+
+
+
+def evaluate_forward_parity(
+    store,
+    dates: list[date],
+    forwards_recipe: Callable,
+    inst_family: str = 'BTC-USD',
+    binning: Optional[str] = None,
+    min_time_to_expiry_hours: float = 2.0,
+    min_moneyness: float = 0.9,
+    max_moneyness: float = 1.1,
+    verbose: bool = True,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Convenience pipeline: load matched options, compute parity errors, and summarise.
+    """
+    df_options = load_matched_options(
+        store=store,
+        dates=dates,
+        inst_family=inst_family,
+        forwards_recipe=forwards_recipe,
+        binning=binning,
+        min_time_to_expiry_hours=min_time_to_expiry_hours,
+        verbose=verbose,
+    )
+    df_parity = compute_option_parity_table(
+        df_options,
+        min_moneyness=min_moneyness,
+        max_moneyness=max_moneyness,
+    )
+    summary = summarize_option_parity(df_parity)
+    return df_parity, summary
 
 
 def calendar_spread_check(

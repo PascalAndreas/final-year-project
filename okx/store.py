@@ -12,7 +12,7 @@ import polars as pl
 from .api import fetch_orderbook_lazy
 
 from tqdm.auto import tqdm
-from .features import trim_ob, strip_ob, parse_option, bin_ob, log_prices, exp_prices, add_tenor
+from .features import trim_ob, strip_ob, parse_option, bin_ob, log_prices, exp_prices, add_tenor, nullify
 
 # Common feature expressions for derived orderbooks
 # 
@@ -49,6 +49,7 @@ def _build_flush_features(depth: Optional[int], binning: Optional[str], inst_typ
         'exp': lambda lf: (exp_prices(lf), True),
         'strip': lambda lf: (strip_ob(lf), True),
         'parse_option': lambda lf: (parse_option(lf), True),
+        'nullify': lambda lf: (nullify(lf), True),
         'dedupe': lambda lf: (lf.unique(maintain_order=True), True),
     }
 
@@ -358,6 +359,8 @@ class OrderbookStore:
             elif callable(feat):
                 lf, feature_exprs = _flush(lf, feature_exprs)
                 lf = feat(lf)
+                if verbose:
+                    print(f"  - applied '{feat.__name__}'")
             else:
                 raise ValueError(f"Feature must be string (registry name), callable, got {type(feat)}")
         

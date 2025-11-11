@@ -32,7 +32,9 @@ from .evaluation import (
     diagnostics,
     evaluate_curve_snapshot,
     EvaluationMetrics,
+    evaluate_forward_parity,
 )
+from .parity import compute_option_parity_table, summarize_option_parity
 from .plotting import (
     plot_pchip_snapshot,
     plot_kalman_snapshot,
@@ -42,6 +44,7 @@ from .plotting import (
     plot_spread_analysis,
     create_comparison_figure,
 )
+from .data import load_matched_options
 
 __all__ = [
     # PCHIP
@@ -67,6 +70,11 @@ __all__ = [
     "diagnostics",
     "evaluate_curve_snapshot",
     "EvaluationMetrics",
+    "compute_option_parity_table",
+    "summarize_option_parity",
+    "evaluate_forward_parity",
+    # Data helpers
+    "load_matched_options",
     # Plotting
     "plot_pchip_snapshot",
     "plot_kalman_snapshot",
@@ -76,4 +84,3 @@ __all__ = [
     "plot_spread_analysis",
     "create_comparison_figure",
 ]
-

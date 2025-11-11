@@ -107,6 +107,13 @@ def exp_prices(lf: pl.LazyFrame) -> pl.LazyFrame:
     exp_exprs = [pl.col(col).exp().alias(col[3:]) for col in log_cols]
     return lf.with_columns(exp_exprs).drop(log_cols)
 
+def nullify(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Replace zero prices with null for bid/ask columns."""
+    return lf.with_columns([
+        pl.when(pl.col('bid_1_px') > 0).then(pl.col('bid_1_px')).otherwise(None).alias('bid_1_px'),
+        pl.when(pl.col('ask_1_px') > 0).then(pl.col('ask_1_px')).otherwise(None).alias('ask_1_px'),
+    ])
+
 
 # ===============================================================
 # Symbol parsing features
@@ -144,6 +151,9 @@ def parse_option(lf: pl.LazyFrame) -> pl.LazyFrame:
           .str.to_uppercase()
           .alias('opt_type'),
     ])
+
+
+
 
 def add_tenor(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
     """

@@ -29,7 +29,14 @@ from typing import Callable, Optional
 from functools import partial
 
 from okx.recipes.helpers import early_roll, finalize_binning
+from forwards.parity import compute_option_parity_table
 from tqdm import tqdm
+
+CONTRACT_MULTIPLIERS = {
+    'BTC-USD': 0.01,
+    'ETH-USD': 0.1,
+}
+
 
 # =============================================================================
 # Helper functions
@@ -82,136 +89,60 @@ def _build_curve_lookup(df_forwards: pl.DataFrame, curve_type: str) -> dict[int,
     return {curve.timeMs: curve for curve in curve_list}
 
 
-def _fetch_options_dataset(
-    store,
-    inst_family: str,
-    dates: list[date],
-    binning: Optional[str],
-    min_time_to_expiry_hours: float,
-    verbose: bool,
-) -> tuple[pl.DataFrame, list[int]]:
-    start_time = datetime.now()
-    cache_name = 'full_options' if binning is None else f'{binning}_options'
+def _get_contract_multiplier(inst_family: str) -> Optional[float]:
+    """Return contract size in base-asset units (e.g., BTC) if non-USD quotes."""
+    return CONTRACT_MULTIPLIERS.get(inst_family.upper())
 
-    options_features = ['trim', 'strip']
-    if binning:
-        options_features.extend(['bin', finalize_binning])
-    else:
-        options_features.extend(['dedupe'])
-    options_features.extend(['tenor', early_roll(min_time_to_expiry_hours), 'parse_option'])
-
-    df_options = store.get(
-        inst_type='OPTION',
-        inst_family=inst_family,
-        dates=dates,
-        depth=1,
-        binning=binning,
-        features=options_features,
-        cache_name=cache_name,
-        verbose=verbose,
-    ).collect()
-
-    if df_options.is_empty():
-        return pl.DataFrame(), []
-
-    if verbose:
-        elapsed = datetime.now() - start_time
-        print(f"Time taken to fetch options: {elapsed}")
-        option_rows = len(df_options)
-        option_time_count = df_options['timeMs'].n_unique()
-        option_expiry_count = df_options['expiry'].n_unique()
-        print(
-            f"Options dataset stats -> rows: {option_rows:,}, "
-            f"unique timeMs: {option_time_count:,}, unique expiries: {option_expiry_count:,}"
-        )
-
-    unique_times = []
-    if binning is None:
-        unique_times = df_options['timeMs'].unique().sort().to_list()
-        if verbose:
-            print(f"Passing {len(unique_times):,} unique option timestamps to forwards recipe")
-
-    return df_options, unique_times
-
-
-def _prepare_forward_recipe(
-    forwards_recipe: Callable,
-    binning: Optional[str],
-    unique_times: list[int],
-) -> Callable:
-    if binning is None:
-        return partial(forwards_recipe, unique_times=unique_times)
-    return partial(forwards_recipe, binning=binning)
-
-
-def _fetch_forward_dataset(
-    store,
-    recipe_for_derivation: Callable,
-    dates: list[date],
-    cache_name: str,
-    verbose: bool,
-) -> pl.DataFrame:
-    start_time = datetime.now()
-    lf_forwards = store.get_derived(
-        recipe_for_derivation,
-        dates=dates,
-        cache_name=cache_name,
-        verbose=verbose,
-    )
-    df_forwards = lf_forwards.collect()
-    if df_forwards.is_empty():
-        return pl.DataFrame()
-
-    if verbose:
-        elapsed = datetime.now() - start_time
-        print(f"Time taken to fetch forwards: {elapsed}")
-        forward_rows = len(df_forwards)
-        forward_time_count = df_forwards['timeMs'].n_unique()
-        print(
-            f"Forward dataset stats -> rows: {forward_rows:,}, "
-            f"unique curve timestamps: {forward_time_count:,}"
-        )
-    return df_forwards
-
-
-def _match_options_with_forwards(
+def _populate_forward_arrays(
     df_options: pl.DataFrame,
     curves_by_time: dict[int, object],
     reconstruct_fn: Callable,
+    contract_multiplier_asset: Optional[float],
     verbose: bool,
-    setup_reference: Optional[datetime] = None,
-) -> pl.DataFrame:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Assign forward bids/asks to every option timestamp in parallel.
+    
+    Steps:
+        1. Sort options by timestamp and identify contiguous groups.
+        2. For each group, reconstruct forwards for the unique maturities present at that time.
+        3. Execute group batches across a thread pool to keep cores busy while staying CPU-bound.
+    
+    Returns:
+        (F_bid_array, F_ask_array, missing_curve_groups)
+    """
     n_rows = len(df_options)
-    if n_rows == 0 or not curves_by_time:
-        return pl.DataFrame()
-
-    F_bid_array = np.full(n_rows, np.nan, dtype=np.float64)
-    F_ask_array = np.full(n_rows, np.nan, dtype=np.float64)
+    if n_rows == 0:
+        return np.array([]), np.array([]), np.array([]), 0
 
     time_values = df_options['timeMs'].to_numpy()
     T_values = df_options['T'].to_numpy()
-
-    match_start = datetime.now()
     sort_idx = np.argsort(time_values, kind='mergesort')
     sorted_times = time_values[sort_idx]
     change_points = np.flatnonzero(np.diff(sorted_times)) + 1 if len(sorted_times) > 1 else np.array([], dtype=int)
     start_indices = np.concatenate(([0], change_points))
     end_indices = np.concatenate((change_points, [len(sorted_times)]))
 
+    F_bid_array = np.full(n_rows, np.nan, dtype=np.float64)
+    F_ask_array = np.full(n_rows, np.nan, dtype=np.float64)
+    needs_fx = contract_multiplier_asset is not None
+    contract_value_array = np.full(n_rows, 1.0 if not needs_fx else np.nan, dtype=np.float64)
     group_count = len(start_indices)
+    if group_count == 0:
+        return F_bid_array, F_ask_array, contract_value_array, 0
 
     def _process_group_range(range_start: int, range_end: int) -> tuple[int, int]:
         processed = 0
         missing_curve = 0
         for group_idx in range(range_start, range_end):
             processed += 1
-            start_idx = start_indices[group_idx]
-            end_idx = end_indices[group_idx]
-            row_indices = sort_idx[start_idx:end_idx]
+            start_idx_group = start_indices[group_idx]
+            end_idx_group = end_indices[group_idx]
+            row_indices = sort_idx[start_idx_group:end_idx_group]
             if len(row_indices) == 0:
                 continue
 
-            timeMs = int(sorted_times[start_idx])
+            timeMs = int(sorted_times[start_idx_group])
             curve = curves_by_time.get(timeMs)
             if curve is None:
                 missing_curve += 1
@@ -231,56 +162,34 @@ def _match_options_with_forwards(
 
             F_bid_array[row_indices] = F_bids_unique[inverse_indices]
             F_ask_array[row_indices] = F_asks_unique[inverse_indices]
+
+            if needs_fx:
+                F0_bid, F0_ask = reconstruct_fn(curve, np.array([0.0], dtype=np.float64))
+                spot_mid = float((np.atleast_1d(F0_bid)[0] + np.atleast_1d(F0_ask)[0]) / 2)
+                usd_value = contract_multiplier_asset * spot_mid
+                contract_value_array[row_indices] = usd_value
         return processed, missing_curve
 
+    max_workers = min(32, max(1, (os.cpu_count() or 4) - 1))
+    chunk_size = max(1, group_count // (max_workers * 8) or 1)
+    chunk_size = min(chunk_size, 50_000)
+
+    progress = tqdm(total=group_count, desc="Matching forwards to options") if verbose else None
     missing_curve_groups = 0
-    if group_count > 0:
-        max_workers = min(32, max(1, (os.cpu_count() or 4) - 1))
-        chunk_size = max(1, group_count // (max_workers * 8) or 1)
-        chunk_size = min(chunk_size, 50_000)
-        progress = None
-        if verbose:
-            progress = tqdm(
-                total=group_count,
-                desc="Matching forwards to options",
-            )
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures: list = []
-            for chunk_start in range(0, group_count, chunk_size):
-                chunk_end = min(group_count, chunk_start + chunk_size)
-                futures.append(executor.submit(_process_group_range, chunk_start, chunk_end))
-            for future in as_completed(futures):
-                processed, missing = future.result()
-                missing_curve_groups += missing
-                if progress:
-                    progress.update(processed)
-        if progress:
-            progress.close()
-    if verbose and missing_curve_groups:
-        print(f"Skipped {missing_curve_groups:,} timestamp groups with no forward curve")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for chunk_start in range(0, group_count, chunk_size):
+            chunk_end = min(group_count, chunk_start + chunk_size)
+            futures.append(executor.submit(_process_group_range, chunk_start, chunk_end))
+        for future in as_completed(futures):
+            processed, missing = future.result()
+            missing_curve_groups += missing
+            if progress:
+                progress.update(processed)
+    if progress:
+        progress.close()
 
-    df_options = df_options.with_columns([
-        pl.Series('F_bid', F_bid_array),
-        pl.Series('F_ask', F_ask_array),
-    ])
-
-    df_options = df_options.with_columns(
-        (pl.col('strike') / ((pl.col('F_bid') + pl.col('F_ask')) / 2)).alias('moneyness')
-    )
-
-    if verbose:
-        time_3 = datetime.now()
-        matched_mask = np.isfinite(F_bid_array) & np.isfinite(F_ask_array)
-        matched_count = int(matched_mask.sum())
-        setup_elapsed = ""
-        if setup_reference is not None:
-            setup_elapsed = f", incl. setup {time_3 - setup_reference}"
-        print(
-            f"Time taken to match forwards to options: core {time_3 - match_start}{setup_elapsed} "
-            f"(matched {matched_count:,} / {n_rows:,} options)"
-        )
-
-    return df_options
+    return F_bid_array, F_ask_array, contract_value_array, missing_curve_groups
 
 def _format_cache_value(value) -> str:
     """Format parameter value for cache name (e.g., 5.0 -> '5.0', '5m' -> '5m')."""
@@ -295,9 +204,8 @@ def _format_cache_value(value) -> str:
         # For other types, use simple string representation
         return str(value).replace(" ", "")
 
-def _build_cache_name(forwards_recipe: Callable, binning: Optional[str] = None) -> str:
-    """Build cache name like '{binning|full}_{param1=val1_}forwards' for forwards recipe."""
-    recipe_name = _get_recipe_name(forwards_recipe)
+def _build_cache_name(curve_type: str, forwards_recipe: Callable, binning: Optional[str] = None) -> str:
+    """Build cache name like '{binning|full}_{curve}_{params}' for forwards recipe."""
     if isinstance(forwards_recipe, partial):
         params = forwards_recipe.keywords or {}
         param_parts = [
@@ -308,12 +216,15 @@ def _build_cache_name(forwards_recipe: Callable, binning: Optional[str] = None) 
     else:
         params_str = ""
     prefix = binning if binning is not None else "full"
-    recipe_part = recipe_name if not params_str else f"{recipe_name}_{params_str}"
+    recipe_part = curve_type
+    if params_str:
+        recipe_part = f"{recipe_part}_{params_str}"
     return f"{prefix}_{recipe_part}_forwards"
 
 # =============================================================================
 # Options data preparation
 # =============================================================================
+
 
 def prepare_options(
     store,
@@ -351,52 +262,121 @@ def prepare_options(
             - F_bid, F_ask (from forward curve)
             - moneyness (strike / ((F_bid + F_ask)/2))
     """
-    df_options, unique_times = _fetch_options_dataset(
-        store=store,
+    # =============================================================================
+    # Step 1: Fetch options dataset
+    # =============================================================================
+    start_time = datetime.now()
+    cache_name = 'full_options' if binning is None else f'{binning}_options'
+
+    options_features = ['trim', 'strip', 'nullify']
+    if binning:
+        options_features.extend(['bin', finalize_binning])
+    else:
+        options_features.extend(['dedupe'])
+    options_features.extend(['tenor', early_roll(min_time_to_expiry_hours), 'parse_option'])
+
+    df_options = store.get(
+        inst_type='OPTION',
         inst_family=inst_family,
         dates=dates,
+        depth=1,
         binning=binning,
-        min_time_to_expiry_hours=min_time_to_expiry_hours,
+        features=options_features,
+        cache_name=cache_name,
         verbose=verbose,
-    )
+    ).collect()
+
     if df_options.is_empty():
         return pl.DataFrame()
 
+    if verbose:
+        time_1 = datetime.now()
+        print(f"Time taken to fetch options: {time_1 - start_time}")
+
+    # =============================================================================
+    # Step 2: Configure forwards recipe and fetch forwards dataset
+    # =============================================================================
     curve_type, reconstruct_fn = _get_reconstruct_fn(forwards_recipe)
-    recipe_for_derivation = _prepare_forward_recipe(
-        forwards_recipe=forwards_recipe,
-        binning=binning,
-        unique_times=unique_times,
-    )
-    cache_name = _build_cache_name(forwards_recipe, binning)
-    df_forwards = _fetch_forward_dataset(
-        store=store,
-        recipe_for_derivation=recipe_for_derivation,
+    forwards_cache_name = _build_cache_name(curve_type, forwards_recipe, binning)
+
+    # Configure forwards recipe with appropriate parameters
+    if binning is None:
+        unique_times = df_options['timeMs'].unique().sort().to_list()
+        forwards_recipe = partial(forwards_recipe, unique_times=unique_times)
+    else: 
+        forwards_recipe = partial(forwards_recipe, binning=binning)
+
+    # Fetch forward dataset
+    start_time = datetime.now()
+    lf_forwards = store.get_derived(
+        forwards_recipe,
         dates=dates,
-        cache_name=cache_name,
+        cache_name=forwards_cache_name,
         verbose=verbose,
     )
+    df_forwards = lf_forwards.collect()
+    
     if df_forwards.is_empty():
         return pl.DataFrame()
 
-    lookup_start = datetime.now()
-    curves_by_time = _build_curve_lookup(df_forwards, curve_type)
-    lookup_end = datetime.now()
     if verbose:
-        print(
-            f"Built forward lookup for {len(curves_by_time):,} timestamps in {lookup_end - lookup_start}"
-        )
+        time_2 = datetime.now()
+        print(f"Time taken to fetch forwards: {time_2 - time_1}")
+
+    # =============================================================================
+    # Step 3: Build forward curve lookup
+    # =============================================================================
+    curves_by_time = _build_curve_lookup(df_forwards, curve_type)
     if not curves_by_time:
         return pl.DataFrame()
+    if verbose:
+        time_3 = datetime.now()
+        print(f"Time taken to build forward lookup: {time_3 - time_2}")
 
-    return _match_options_with_forwards(
-        df_options=df_options,
-        curves_by_time=curves_by_time,
-        reconstruct_fn=reconstruct_fn,
-        verbose=verbose,
-        setup_reference=lookup_end,
+    # =============================================================================
+    # Step 4: Match options with forwards
+    # =============================================================================
+    contract_multiplier_asset = _get_contract_multiplier(inst_family)
+    match_start = datetime.now()
+    F_bid_array, F_ask_array, contract_value_array, missing_curve_groups = _populate_forward_arrays(
+        df_options,
+        curves_by_time,
+        reconstruct_fn,
+        contract_multiplier_asset,
+        verbose,
+    )
+    if F_bid_array.size == 0:
+        return pl.DataFrame()
+
+    if contract_multiplier_asset is not None:
+        df_options = df_options.with_columns(
+            pl.Series('contract_value_usd', contract_value_array)
+        ).with_columns([
+            (pl.col('bid_1_px') * pl.col('contract_value_usd')).alias('bid_1_px'),
+            (pl.col('ask_1_px') * pl.col('contract_value_usd')).alias('ask_1_px'),
+        ]).drop('contract_value_usd')
+
+    df_options = df_options.with_columns([
+        pl.Series('F_bid', F_bid_array),
+        pl.Series('F_ask', F_ask_array),
+    ])
+
+    df_options = df_options.with_columns(
+        (pl.col('strike') / ((pl.col('F_bid') + pl.col('F_ask')) / 2)).alias('moneyness')
     )
 
+    if verbose:
+        time_4 = datetime.now()
+        matched_mask = np.isfinite(F_bid_array) & np.isfinite(F_ask_array)
+        matched_count = int(matched_mask.sum())
+        print(
+            f"Time taken to match forwards to options: core {time_4 - match_start}, "
+            f"incl. setup {time_4 - time_3} (matched {matched_count:,} / {len(df_options):,} options)"
+        )
+        if missing_curve_groups:
+            print(f"Skipped {missing_curve_groups:,} timestamp groups with no forward curve")
+
+    return df_options
 
 # =============================================================================
 # Main options comparison recipe
@@ -466,10 +446,6 @@ def build_forwards_options_comparison(
         >>> print(df_comp.group_by('expiry_dt')['error_mid_bps'].mean())
     """
     
-    # =========================================================================
-    # Step 1: Prepare options with fitted forwards
-    # =========================================================================
-    
     df_options = prepare_options(
         store=store,
         inst_family=inst_family,
@@ -480,108 +456,8 @@ def build_forwards_options_comparison(
         verbose=verbose,
     )
     
-    if df_options.is_empty():
-        return pl.DataFrame()
-    
-    # =========================================================================
-    # Step 2: Filter by moneyness and create call-put pairs
-    # =========================================================================
-    
-    # Filter by moneyness
-    df_options = df_options.filter(
-        (pl.col('moneyness') >= min_moneyness) & 
-        (pl.col('moneyness') <= max_moneyness)
+    return compute_option_parity_table(
+        df_options,
+        min_moneyness=min_moneyness,
+        max_moneyness=max_moneyness,
     )
-    
-    if df_options.is_empty():
-        return pl.DataFrame()
-    
-    # Separate calls and puts
-    df_calls = df_options.filter(pl.col('opt_type') == 'C').select([
-        'timeMs', 'expiry', 'strike', 'T', 'moneyness',
-        'bid_1_px', 'ask_1_px', 'F_bid', 'F_ask'
-    ]).rename({
-        'bid_1_px': 'call_bid_1_px',
-        'ask_1_px': 'call_ask_1_px',
-    })
-    
-    df_puts = df_options.filter(pl.col('opt_type') == 'P').select([
-        'timeMs', 'expiry', 'strike', 'bid_1_px', 'ask_1_px'
-    ]).rename({
-        'bid_1_px': 'put_bid_1_px',
-        'ask_1_px': 'put_ask_1_px',
-    })
-    
-    # Inner join on timeMs, expiry, strike to create matched pairs
-    df_pairs = df_calls.join(df_puts, on=['timeMs', 'expiry', 'strike'], how='inner')
-    
-    if df_pairs.is_empty():
-        return pl.DataFrame()
-    
-    # =========================================================================
-    # Step 3: Compute implied forwards and errors
-    # =========================================================================
-    
-    # Extract arrays for vectorized computation
-    strikes = df_pairs['strike'].to_numpy()
-    
-    call_bids = df_pairs['call_bid_1_px'].to_numpy()
-    call_asks = df_pairs['call_ask_1_px'].to_numpy()
-    put_bids = df_pairs['put_bid_1_px'].to_numpy()
-    put_asks = df_pairs['put_ask_1_px'].to_numpy()
-    
-    F_bids = df_pairs['F_bid'].to_numpy()
-    F_asks = df_pairs['F_ask'].to_numpy()
-    
-    # Skip invalid prices
-    valid_mask = ~(
-        np.isnan(call_bids) | np.isnan(call_asks) | 
-        np.isnan(put_bids) | np.isnan(put_asks) |
-        (call_bids <= 0) | (call_asks <= 0) |
-        (put_bids <= 0) | (put_asks <= 0) |
-        np.isnan(F_bids) | np.isnan(F_asks)
-    )
-    
-    if not np.any(valid_mask):
-        return pl.DataFrame()
-    
-    # Compute implied forwards from put-call parity
-    # F ≈ K + (C - P)
-    # Conservative bid-ask handling:
-    F_implied_bids = strikes + (call_bids - put_asks)
-    F_implied_asks = strikes + (call_asks - put_bids)
-    F_implied_mids = (F_implied_bids + F_implied_asks) / 2
-    
-    F_mids = (F_bids + F_asks) / 2
-    
-    # Compute errors in bps
-    error_bids_bps = (np.log(F_implied_bids) - np.log(F_bids)) * 10000
-    error_asks_bps = (np.log(F_implied_asks) - np.log(F_asks)) * 10000
-    error_mids_bps = (np.log(F_implied_mids) - np.log(F_mids)) * 10000
-    
-    # Compute option spreads in bps
-    call_spread_bps = (call_asks - call_bids) / ((call_asks + call_bids) / 2) * 10000
-    put_spread_bps = (put_asks - put_bids) / ((put_asks + put_bids) / 2) * 10000
-    
-    valid_series = pl.Series('valid_mask', valid_mask)
-    
-    # Add computed columns to df_pairs
-    df_result = (
-        df_pairs.with_columns([
-            pl.Series('F_mid', F_mids),
-            pl.Series('F_implied_bid', F_implied_bids),
-            pl.Series('F_implied_ask', F_implied_asks),
-            pl.Series('F_implied_mid', F_implied_mids),
-            pl.Series('error_bid_bps', error_bids_bps),
-            pl.Series('error_ask_bps', error_asks_bps),
-            pl.Series('error_mid_bps', error_mids_bps),
-            pl.Series('call_spread_bps', call_spread_bps),
-            pl.Series('put_spread_bps', put_spread_bps),
-            valid_series,
-        ])
-        .rename({'expiry': 'expiry_dt'})
-        .filter(pl.col('valid_mask'))
-        .drop('valid_mask')
-    )
-    
-    return df_result

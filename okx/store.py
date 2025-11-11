@@ -115,17 +115,14 @@ class Manifest:
 class OrderbookStore:
     """Storage manager for raw orderbooks and derived caches."""
     
-    def __init__(self, data_root: str | pathlib.Path, manifest_path: str | pathlib.Path,
-                 batch_days: Optional[int] = None):
+    def __init__(self, data_root: str | pathlib.Path, manifest_path: str | pathlib.Path):
         """
         Args:
             data_root: Root directory for orderbook/ and cache/ subdirs
             manifest_path: Path to SQLite manifest database
-            batch_days: If set, process dates in batches of this size to avoid memory issues
         """
         self.root = pathlib.Path(data_root)
         self.manifest = Manifest(pathlib.Path(manifest_path))
-        self.batch_days = batch_days
 
     def _date_range(self, start: Optional[datetime] = None, end: Optional[datetime] = None,
                     dates: Optional[list[date]] = None) -> list[date]:
@@ -271,9 +268,10 @@ class OrderbookStore:
     def _get(self, inst_family: str, inst_type: str, dates: list[date],
              builder: Callable[[list[date]], pl.LazyFrame],
              cache_name: Optional[str] = None,
+             batch_days: Optional[int] = None,
              verbose: bool = False) -> pl.LazyFrame:
         """Helper for get() and get_derived() to handle caching logic with optional batching."""
-        needs_batching = self.batch_days is not None and len(dates) > self.batch_days
+        needs_batching = batch_days is not None and len(dates) > batch_days
         
         if not needs_batching:
             # Process all dates at once
@@ -281,7 +279,7 @@ class OrderbookStore:
             return self._load_from_cache(inst_family, inst_type, dates, cache_name) if cache_name else builder(dates)
         
         # Process dates in batches
-        batches = [dates[i:i + self.batch_days] for i in range(0, len(dates), self.batch_days)]
+        batches = [dates[i:i + batch_days] for i in range(0, len(dates), batch_days)]
         batch_iter = tqdm(batches, desc="Processing batches", disable=not verbose)
         
         if cache_name:
@@ -384,12 +382,17 @@ class OrderbookStore:
             dates: Optional[list[date]] = None,
             depth: Optional[int] = None, binning: Optional[str] = None, 
             features: Optional[list] = None, cache_name: Optional[str] = None,
+            batch_days: Optional[int] = None,
             verbose: bool = False) -> pl.LazyFrame:
         """
         Get orderbook data with optional transformations.
         
         Provide either (start, end) or dates. Features can include registry names,
         callables, 'trim', or 'bin'. If cache_name provided, result is cached.
+        
+        Args:
+            batch_days: If set, process dates in batches of this size to avoid memory issues.
+                       Only applies when number of dates exceeds this threshold.
         """
         dates = self._date_range(start, end, dates)
         
@@ -399,21 +402,26 @@ class OrderbookStore:
             depth, binning, features,
             verbose=verbose,
         )
-        return self._get(inst_family, inst_type, dates, builder, cache_name, verbose)
+        return self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, verbose)
     
     def get_derived(self, recipe: Callable[[object, list[date]], pl.LazyFrame],
                     start: Optional[datetime] = None, end: Optional[datetime] = None,
                     dates: Optional[list[date]] = None,
                     cache_name: Optional[str] = None,
+                    batch_days: Optional[int] = None,
                     verbose: bool = False) -> pl.LazyFrame:
         """
         Get derived data via recipe function with signature (store, dates) -> LazyFrame.
         
         Provide either (start, end) or dates. If cache_name provided, result is cached.
+        
+        Args:
+            batch_days: If set, process dates in batches of this size to avoid memory issues.
+                       Only applies when number of dates exceeds this threshold.
         """
         dates = self._date_range(start, end, dates)
         builder = lambda dates_to_build: recipe(self, dates_to_build, verbose=verbose)
-        return self._get('__derived__', '__derived__', dates, builder, cache_name, verbose)
+        return self._get('__derived__', '__derived__', dates, builder, cache_name, batch_days, verbose)
     
     # =============================================================================
     # Data Population

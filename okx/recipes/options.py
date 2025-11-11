@@ -283,6 +283,7 @@ def prepare_options(
         binning=binning,
         features=options_features,
         cache_name=cache_name,
+        batch_days=3,
         verbose=verbose,
     ).collect()
 
@@ -362,7 +363,7 @@ def prepare_options(
     ])
 
     df_options = df_options.with_columns(
-        (pl.col('strike') / ((pl.col('F_bid') + pl.col('F_ask')) / 2)).alias('moneyness')
+        (pl.col('strike') / ((pl.col('F_bid') + pl.col('F_ask')) / 2)).log().alias('moneyness')
     )
 
     if verbose:

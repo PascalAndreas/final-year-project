@@ -34,6 +34,7 @@ def prepare_pillars(
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
     cache_name_suffix: str = "pillars",
+    batch_days: Optional[int] = None,
     verbose: bool = False,
 ) -> pl.LazyFrame:
     """
@@ -68,6 +69,7 @@ def prepare_pillars(
         'depth': 1,
         'binning': binning,
         'cache_name': cache_name,
+        'batch_days': batch_days,
     }
 
     lf_swap = store.get(
@@ -220,6 +222,7 @@ def build_forwards_pchip(
         min_time_to_expiry_hours=min_time_to_expiry_hours,
         unique_times=unique_times,
         drop_pillar_idx=drop_pillar_idx,
+        batch_days=3,
     )
     
     df_pillars = pillars_lf.collect()
@@ -326,6 +329,7 @@ def build_forwards_kalman(
         min_time_to_expiry_hours=min_time_to_expiry_hours,
         unique_times=unique_times,
         drop_pillar_idx=drop_pillar_idx,
+        batch_days=3,
     )
     
     df_pillars = pillars_lf.collect()

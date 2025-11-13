@@ -26,7 +26,6 @@ def store() -> OrderbookStore:
     return OrderbookStore(
         data_root=str(DATA_ROOT),
         manifest_path=str(MANIFEST_PATH),
-        batch_days=1,
     )
 
 

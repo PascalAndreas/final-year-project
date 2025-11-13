@@ -11,157 +11,19 @@ Usage with functools.partial for configuration:
     lf = store.get_derived(recipe, start, end, cache_name='forwards_pchip_5m')
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import polars as pl
 import numpy as np
-from datetime import datetime, date, timedelta, timezone
-from typing import Optional, Tuple
+from datetime import datetime, date
+from typing import Callable, Optional
+from functools import partial
 
-from forwards.pchip import fit_pchip_curve, ewma_smooth, curves_to_polars, PCHIPCurve
+from forwards.pchip import fit_pchip_curve, ewma_smooth, curves_to_polars
 from forwards.kalman_ns import kalman_filter, states_to_polars
-from okx.recipes.helpers import early_roll, finalize_binning
-
-# =============================================================================
-# Pillar preparation
-# =============================================================================
-
-
-def prepare_pillars(
-    store,
-    inst_family: str,
-    dates: list[date],
-    binning: Optional[str] = None,
-    min_time_to_expiry_hours: float = 2.0,
-    unique_times: Optional[list[int]] = None,
-    drop_pillar_idx: Optional[int] = None,
-    cache_name_suffix: str = "pillars",
-    batch_days: Optional[int] = None,
-    verbose: bool = False,
-) -> pl.LazyFrame:
-    """
-    Prepare concatenated pillar data from SWAP and FUTURES orderbooks.
-
-    Returns a LazyFrame sorted by (timeMs, T) that contains the latest snapshot
-    for each instrument at or before every requested timestamp. This keeps the
-    function compatible with store.get_derived() caching and avoids Python-side
-    looping over symbols/timestamps.
-    """
-    if not dates:
-        return pl.DataFrame().lazy()
-
-    # Build feature list (ordered for performance: strip early to reduce columns)
-    features_base = ['trim', 'strip']
-    if binning:
-        features_base.extend(['bin', finalize_binning])
-    features_base.extend(['spread', 'rel_spread', 'tenor', 'log'])
-
-    features_swap = features_base.copy()
-
-    features_futures = features_base.copy()
-    features_futures.append(early_roll(min_time_to_expiry_hours))
-
-    suffix = cache_name_suffix or "pillars"
-    prefix = "full" if binning is None else binning
-    cache_name = f"{prefix}_{suffix}"
-
-    shared_params = {
-        'inst_family': inst_family,
-        'dates': dates,
-        'depth': 1,
-        'binning': binning,
-        'cache_name': cache_name,
-        'batch_days': batch_days,
-    }
-
-    lf_swap = store.get(
-        inst_type='SWAP',
-        features=features_swap,
-        **shared_params,
-    ).sort('timeMs')
-
-    lf_futures = store.get(
-        inst_type='FUTURES',
-        features=features_futures,
-        **shared_params,
-    ).sort(['symbol', 'timeMs'])
-
-    if unique_times is not None:
-        lf_times = pl.DataFrame({'timeMs': sorted(unique_times)}).lazy()
-    else:
-        lf_times = (
-            pl.concat([
-                lf_swap.select('timeMs'),
-                lf_futures.select('timeMs'),
-            ])
-            .unique()
-            .sort('timeMs')
-        )
-
-    # Align swap snapshots to requested timestamps (latest observation <= timeMs)
-    lf_swap_snapshots = (
-        lf_times.join_asof(
-            lf_swap,
-            on='timeMs',
-            strategy='backward',
-            suffix='_hist',
-        )
-        .drop('timeMs_hist', strict=False)
-        .filter(pl.col('ln_bid_1_px').is_not_null())
-    )
-
-    lf_valid_times = (
-        lf_swap_snapshots.select('timeMs')
-        .unique()
-        .sort('timeMs')
-    )
-
-    # Align each futures symbol independently using cross join + asof
-    lf_symbol_times = (
-        lf_futures.select('symbol')
-        .unique()
-        .join(lf_valid_times, how='cross')
-        .sort(['symbol', 'timeMs'])
-    )
-    lf_futures_snapshots = (
-        lf_symbol_times.join_asof(
-            lf_futures,
-            on='timeMs',
-            by='symbol',
-            strategy='backward',
-            suffix='_hist',
-        )
-        .drop(['symbol_hist', 'timeMs_hist'], strict=False)
-        .filter(pl.col('ln_bid_1_px').is_not_null())
-        .filter(pl.col('expiry') > pl.col('timeMs'))
-    )
-
-    # Ensure consistent column order before concat (LazyFrames don't have .columns)
-    common_cols = ['timeMs', 'symbol', 'rel_spread', 'expiry', 'T', 
-                   'ln_bid_1_px', 'ln_ask_1_px']
-
-    pillars = pl.concat([
-        lf_swap_snapshots.select(common_cols),
-        lf_futures_snapshots.select(common_cols),
-    ])
-
-    pillars = (
-        pillars
-        .sort(['timeMs', 'T'])
-        .with_columns([
-            pl.int_range(pl.len()).over('timeMs').alias('pillar_idx'),
-            pl.len().over('timeMs').alias('_pillars_per_time'),
-        ])
-    )
-
-    if drop_pillar_idx is not None:
-        pillars = pillars.filter(
-            pl.col('_pillars_per_time') > drop_pillar_idx
-        ).filter(pl.col('pillar_idx') != drop_pillar_idx)
-
-    return (
-        pillars
-        .drop('_pillars_per_time')
-        .sort(['timeMs', 'T'])
-    )
+from okx.recipes.pillars import prepare_pillars
+from tqdm import tqdm
 
 # =============================================================================
 # Helper functions for forward recipes
@@ -392,3 +254,293 @@ def build_forwards_kalman(
         print(f"Time taken to convert states: {convert_end - convert_start}")
 
     return df_result.lazy()
+
+
+# =============================================================================
+# Helper functions for forward assignment
+# =============================================================================
+
+def _get_recipe_name(recipe: Callable) -> str:
+    """Extract function name from recipe (handles functools.partial)."""
+    if isinstance(recipe, partial):
+        return recipe.func.__name__
+    return recipe.__name__
+
+
+def _reconstruct_forward_pchip(curve, T_target: float | np.ndarray) -> tuple[float | np.ndarray, float | np.ndarray]:
+    """Reconstruct forward from a PCHIPCurve object."""
+    from forwards.pchip import reconstruct_forward
+    return reconstruct_forward(curve, T_target)
+
+
+def _reconstruct_forward_kalman(state, T_target: float | np.ndarray) -> tuple[float | np.ndarray, float | np.ndarray]:
+    """Reconstruct forward from Kalman NS state."""
+    from forwards.kalman_ns import reconstruct_ns_forward
+    F_bid = reconstruct_ns_forward(state, T_target, use_bid=True)
+    F_ask = reconstruct_ns_forward(state, T_target, use_bid=False)
+    return F_bid, F_ask
+
+
+def _get_reconstruct_fn(forwards_recipe: Callable) -> tuple[str, Callable]:
+    """Get the appropriate reconstruction function and curve type based on recipe name."""
+    recipe_name = _get_recipe_name(forwards_recipe)
+    if 'pchip' in recipe_name.lower():
+        return 'pchip', _reconstruct_forward_pchip
+    elif 'kalman' in recipe_name.lower():
+        return 'kalman', _reconstruct_forward_kalman
+    else:
+        raise ValueError(f"Unknown recipe type: {recipe_name}")
+
+
+def _build_curve_lookup(df_forwards: pl.DataFrame, curve_type: str) -> dict[int, object]:
+    """Materialize forward curves/states keyed by timestamp for fast lookup."""
+    if curve_type == 'pchip':
+        from forwards.pchip import PCHIPCurve
+        curves = PCHIPCurve.from_polars(df_forwards)
+    elif curve_type == 'kalman':
+        from forwards.kalman_ns import NSCarryState
+        curves = NSCarryState.from_polars(df_forwards)
+    else:
+        raise ValueError(f"Unsupported curve type: {curve_type}")
+
+    if isinstance(curves, list):
+        curve_list = curves
+    else:
+        curve_list = [curves]
+
+    return {curve.timeMs: curve for curve in curve_list}
+
+
+def _populate_forward_arrays(
+    df_data: pl.DataFrame,
+    curves_by_time: dict[int, object],
+    reconstruct_fn: Callable,
+    verbose: bool,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Assign forward bids/asks to every timestamp in parallel.
+    
+    Steps:
+        1. Sort data by timestamp and identify contiguous groups.
+        2. For each group, reconstruct forwards for the unique maturities present at that time.
+        3. Execute group batches across a thread pool to keep cores busy while staying CPU-bound.
+    
+    Returns:
+        (F_bid_array, F_ask_array, missing_curve_groups)
+    """
+    n_rows = len(df_data)
+    if n_rows == 0:
+        return np.array([]), np.array([]), 0
+
+    time_values = df_data['timeMs'].to_numpy()
+    T_values = df_data['T'].to_numpy()
+    sort_idx = np.argsort(time_values, kind='mergesort')
+    sorted_times = time_values[sort_idx]
+    change_points = np.flatnonzero(np.diff(sorted_times)) + 1 if len(sorted_times) > 1 else np.array([], dtype=int)
+    start_indices = np.concatenate(([0], change_points))
+    end_indices = np.concatenate((change_points, [len(sorted_times)]))
+
+    F_bid_array = np.full(n_rows, np.nan, dtype=np.float64)
+    F_ask_array = np.full(n_rows, np.nan, dtype=np.float64)
+    group_count = len(start_indices)
+    if group_count == 0:
+        return F_bid_array, F_ask_array, 0
+
+    def _process_group_range(range_start: int, range_end: int) -> tuple[int, int]:
+        processed = 0
+        missing_curve = 0
+        for group_idx in range(range_start, range_end):
+            processed += 1
+            start_idx_group = start_indices[group_idx]
+            end_idx_group = end_indices[group_idx]
+            row_indices = sort_idx[start_idx_group:end_idx_group]
+            if len(row_indices) == 0:
+                continue
+
+            timeMs = int(sorted_times[start_idx_group])
+            curve = curves_by_time.get(timeMs)
+            if curve is None:
+                missing_curve += 1
+                continue
+
+            data_T = T_values[row_indices]
+            if data_T.size == 0:
+                continue
+
+            unique_T, inverse_indices = np.unique(data_T, return_inverse=True)
+            if unique_T.size == 0:
+                continue
+
+            F_bids_unique, F_asks_unique = reconstruct_fn(curve, unique_T)
+            F_bids_unique = np.atleast_1d(np.asarray(F_bids_unique, dtype=np.float64))
+            F_asks_unique = np.atleast_1d(np.asarray(F_asks_unique, dtype=np.float64))
+
+            F_bid_array[row_indices] = F_bids_unique[inverse_indices]
+            F_ask_array[row_indices] = F_asks_unique[inverse_indices]
+        return processed, missing_curve
+
+    max_workers = min(32, max(1, (os.cpu_count() or 4) - 1))
+    chunk_size = max(1, group_count // (max_workers * 8) or 1)
+    chunk_size = min(chunk_size, 50_000)
+
+    progress = tqdm(total=group_count, desc="Matching forwards") if verbose else None
+    missing_curve_groups = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for chunk_start in range(0, group_count, chunk_size):
+            chunk_end = min(group_count, chunk_start + chunk_size)
+            futures.append(executor.submit(_process_group_range, chunk_start, chunk_end))
+        for future in as_completed(futures):
+            processed, missing = future.result()
+            missing_curve_groups += missing
+            if progress:
+                progress.update(processed)
+    if progress:
+        progress.close()
+
+    return F_bid_array, F_ask_array, missing_curve_groups
+
+
+def _format_cache_value(value) -> str:
+    """Format parameter value for cache name (e.g., 5.0 -> '5.0', '5m' -> '5m')."""
+    if isinstance(value, float):
+        # Format floats to remove trailing zeros
+        return f"{value:.10g}"
+    elif isinstance(value, (int, str)):
+        return str(value)
+    elif value is None:
+        return "None"
+    else:
+        # For other types, use simple string representation
+        return str(value).replace(" ", "")
+
+
+def _build_cache_name(curve_type: str, forwards_recipe: Callable, binning: Optional[str] = None) -> str:
+    """Build cache name like '{binning|full}_{curve}_{params}' for forwards recipe."""
+    if isinstance(forwards_recipe, partial):
+        params = forwards_recipe.keywords or {}
+        param_parts = [
+            f"{key}={_format_cache_value(params[key])}"
+            for key in sorted(params)
+        ]
+        params_str = "_".join(param_parts)
+    else:
+        params_str = ""
+    prefix = binning if binning is not None else "full"
+    recipe_part = curve_type
+    if params_str:
+        recipe_part = f"{recipe_part}_{params_str}"
+    return f"{prefix}_{recipe_part}_forwards"
+
+# =============================================================================
+# Forward assignment recipe
+# =============================================================================
+
+def assign_forwards(
+    store,
+    df_data: pl.DataFrame,
+    dates: list[date],
+    forwards_recipe: Callable,
+    inst_family: str = 'BTC-USD',
+    binning: Optional[str] = None,
+    verbose: bool = True,
+) -> pl.DataFrame:
+    """
+    Assign forward bid/ask prices to a DataFrame with 'timeMs' and 'T' columns.
+    
+    This function:
+    - Fetches forward curves using the provided recipe (via get_derived for caching)
+    - Adds F_bid, F_ask columns for each row based on timeMs and T
+    
+    Args:
+        df_data: DataFrame with 'timeMs' and 'T' columns
+        store: OrderbookStore instance
+        dates: List of dates to load forward curves for
+        forwards_recipe: Pre-configured recipe function (use functools.partial)
+        inst_family: Instrument family (e.g., 'BTC-USD')
+        binning: Binning interval ('1m', '5m', etc) or None for unbinned
+        verbose: Whether to print progress (default: True)
+    
+    Returns:
+        DataFrame with added columns:
+            - F_bid, F_ask (from forward curve)
+    """
+    if df_data.is_empty():
+        return pl.DataFrame()
+    
+    # Validate required columns
+    required_cols = {'timeMs', 'T'}
+    if not required_cols.issubset(df_data.columns):
+        raise ValueError(f"DataFrame must contain columns: {required_cols}")
+    
+    start_time = datetime.now()
+    
+    # =============================================================================
+    # Step 1: Configure forwards recipe and fetch forwards dataset
+    # =============================================================================
+    curve_type, reconstruct_fn = _get_reconstruct_fn(forwards_recipe)
+    forwards_cache_name = _build_cache_name(curve_type, forwards_recipe, binning)
+
+    # Configure forwards recipe with appropriate parameters
+    if binning is None:
+        unique_times = df_data['timeMs'].unique().sort().to_list()
+        forwards_recipe = partial(forwards_recipe, unique_times=unique_times)
+    else: 
+        forwards_recipe = partial(forwards_recipe, binning=binning)
+
+    # Fetch forward dataset
+    lf_forwards = store.get_derived(
+        forwards_recipe,
+        dates=dates,
+        cache_name=forwards_cache_name,
+        verbose=verbose,
+    )
+    df_forwards = lf_forwards.collect()
+    
+    if df_forwards.is_empty():
+        return pl.DataFrame()
+
+    if verbose:
+        time_1 = datetime.now()
+        print(f"Time taken to fetch forwards: {time_1 - start_time}")
+
+    # =============================================================================
+    # Step 2: Build forward curve lookup
+    # =============================================================================
+    curves_by_time = _build_curve_lookup(df_forwards, curve_type)
+    if not curves_by_time:
+        return pl.DataFrame()
+    if verbose:
+        time_2 = datetime.now()
+        print(f"Time taken to build forward lookup: {time_2 - time_1}")
+
+    # =============================================================================
+    # Step 3: Match data with forwards
+    # =============================================================================
+    match_start = datetime.now()
+    F_bid_array, F_ask_array, missing_curve_groups = _populate_forward_arrays(
+        df_data,
+        curves_by_time,
+        reconstruct_fn,
+        verbose,
+    )
+    if F_bid_array.size == 0:
+        return pl.DataFrame()
+
+    df_data = df_data.with_columns([
+        pl.Series('F_bid', F_bid_array),
+        pl.Series('F_ask', F_ask_array),
+    ])
+
+    if verbose:
+        time_3 = datetime.now()
+        matched_mask = np.isfinite(F_bid_array) & np.isfinite(F_ask_array)
+        matched_count = int(matched_mask.sum())
+        print(
+            f"Time taken to match forwards: core {time_3 - match_start}, "
+            f"incl. setup {time_3 - time_2} (matched {matched_count:,} / {len(df_data):,} rows)"
+        )
+        if missing_curve_groups:
+            print(f"Skipped {missing_curve_groups:,} timestamp groups with no forward curve")
+
+    return df_data

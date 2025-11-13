@@ -173,6 +173,9 @@ def fetch_orderbook_lazy(inst_family: str, inst_type: str, date_val, temp_base_d
         include_criterion = lambda filename: filename.startswith(f'{inst_family}-SWAP')
     elif inst_type == 'FUTURES':
         include_criterion = lambda filename: filename.startswith(f'{inst_family}-')
+    elif inst_type == 'SPOT':
+        # SPOT instruments format: BTC-USD.OK.csv (not BTC-USDT.OK.csv or BTC-USDC.OK.csv)
+        include_criterion = lambda filename: filename.startswith(f'{inst_family}.OK')
     else:
         include_criterion = None
     

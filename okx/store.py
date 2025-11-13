@@ -12,46 +12,7 @@ import polars as pl
 from .api import fetch_orderbook_lazy
 
 from tqdm.auto import tqdm
-from .features import trim_ob, strip_ob, parse_option, bin_ob, log_prices, exp_prices, add_tenor, nullify
-
-# Common feature expressions for derived orderbooks
-# 
-# NOTE: Registry features are simple Polars expressions that can be batched together.
-# They are flushed (applied) before:
-#   - 'trim': In case they depend on columns that will be removed
-#   - 'bin': In case they depend on tick-by-tick structure
-#   - Callables: In case the callable depends on them or transforms the LazyFrame
-# 
-# If you add a new feature type that requires special handling (e.g., needs flushing
-# before other registry features), implement it as a callable instead.
-FEATURES = {
-    "mid": (pl.col("ask_1_px") + pl.col("bid_1_px")) / 2,
-    "spread": pl.col("ask_1_px") - pl.col("bid_1_px"),
-    "rel_spread": (pl.col("ask_1_px") - pl.col("bid_1_px")) / ((pl.col("ask_1_px") + pl.col("bid_1_px")) / 2),
-    "imbalance1": (pl.col("bid_1_qty") - pl.col("ask_1_qty")) / (pl.col("bid_1_qty") + pl.col("ask_1_qty")),
-    "imbalance5": (
-        (sum(pl.col(f"bid_{i}_qty") for i in range(1, 6)) - sum(pl.col(f"ask_{i}_qty") for i in range(1, 6)))
-        / (sum(pl.col(f"bid_{i}_qty") for i in range(1, 6)) + sum(pl.col(f"ask_{i}_qty") for i in range(1, 6)))
-    ),
-    "bid_volume": sum(pl.col(f"bid_{i}_qty") for i in range(1, 6)),
-    "ask_volume": sum(pl.col(f"ask_{i}_qty") for i in range(1, 6)),
-}
-
-# Transformations that must be executed immediately (cannot sit in the FEATURES expr bucket)
-# because they either depend on runtime config (depth/binning), mutate the schema, or require
-# maintaining ordering/uniqueness guarantees.
-def _build_flush_features(depth: Optional[int], binning: Optional[str], inst_type: str):
-    return {
-        'trim': (lambda lf: (trim_ob(lf, depth), True)) if depth is not None else (lambda lf: (lf, False)),
-        'bin': (lambda lf: (bin_ob(lf, binning), True)) if binning is not None else (lambda lf: (lf, False)),
-        'tenor': lambda lf: (add_tenor(lf, inst_type), True),
-        'log': lambda lf: (log_prices(lf), True),
-        'exp': lambda lf: (exp_prices(lf), True),
-        'strip': lambda lf: (strip_ob(lf), True),
-        'parse_option': lambda lf: (parse_option(lf), True),
-        'nullify': lambda lf: (nullify(lf), True),
-        'dedupe': lambda lf: (lf.unique(maintain_order=True), True),
-    }
+from .features import FEATURES, build_flush_features, trim_ob, bin_ob
 
 # =============================================================================
 # Manifest
@@ -261,6 +222,24 @@ class OrderbookStore:
             lf.sink_parquet(str(tmp), compression='zstd')
             tmp.rename(path)
     
+    def inspect(self, fn: Callable[[pl.LazyFrame, str, str, str], any], 
+                variant: str = 'raw', verbose: bool = True) -> list[any]:
+        """Run arbitrary function over all parquet files in manifest (read-only)."""
+        with sqlite3.connect(self.manifest.path) as conn:
+            rows = conn.execute("SELECT inst_family, inst_type, date, path FROM files WHERE variant=?", 
+                              (variant,)).fetchall()
+        
+        results = []
+        for i, (inst_family, inst_type, date_str, path_str) in enumerate(rows):
+            if verbose:
+                print(f"[{i+1}/{len(rows)}] Inspecting {inst_family}/{inst_type}/{date_str}")
+            path = pathlib.Path(path_str)
+            lf = pl.scan_parquet(path)
+            result = fn(lf, inst_family, inst_type, date_str)
+            results.append(result)
+        
+        return results
+    
     # =============================================================================
     # Data Retrieval
     # =============================================================================
@@ -294,7 +273,7 @@ class OrderbookStore:
 
     def _apply_transforms(self, lf: pl.LazyFrame, inst_family: str, inst_type: str,
                           depth: Optional[int], binning: Optional[str], 
-                          features: Optional[list], verbose: bool = False) -> pl.LazyFrame:
+                          features: list = [], verbose: bool = False) -> pl.LazyFrame:
         """
         Apply transformations in order specified by features list.
         
@@ -311,14 +290,6 @@ class OrderbookStore:
                 f"(depth={depth}, binning={binning}, features={feature_summary})"
             )
         
-        if not features:
-            # No features: apply trim then bin
-            if depth is not None:
-                lf = trim_ob(lf, depth)
-            if binning is not None:
-                lf = bin_ob(lf, binning)
-            return lf
-        
         # Helper to flush accumulated feature expressions
         def _flush(frame: pl.LazyFrame, exprs: list) -> tuple[pl.LazyFrame, list]:
             if exprs:
@@ -326,7 +297,7 @@ class OrderbookStore:
             return frame, []
         
         # Callable features that require flushing before execution
-        FLUSH_FEATURES = _build_flush_features(depth, binning, inst_type)
+        FLUSH_FEATURES = build_flush_features(depth, binning, inst_type)
         
         # Process features list in order
         trim_applied = False
@@ -340,17 +311,13 @@ class OrderbookStore:
                 lf, was_applied = FLUSH_FEATURES[feat](lf)
                 if verbose and was_applied:
                     print(f"  - applied '{feat}'")
-                
                 # Track trim/bin application for default fallback
                 if feat == 'trim':
                     trim_applied = was_applied
-                elif feat == 'bin':
+                elif feat.startswith('bin'):
                     bin_applied = was_applied
-            elif isinstance(feat, str):
+            elif feat in FEATURES:
                 # Registry feature
-                if feat not in FEATURES:
-                    available = list(FEATURES.keys()) + list(FLUSH_FEATURES.keys())
-                    raise ValueError(f"Unknown feature '{feat}'. Available: {available}")
                 feature_exprs.append(FEATURES[feat].alias(feat))
                 if verbose:
                     print(f"  - applied '{feat}'")
@@ -360,6 +327,9 @@ class OrderbookStore:
                 if verbose:
                     print(f"  - applied '{feat.__name__}'")
             else:
+                if isinstance(feat, str):
+                    available = [*FEATURES.keys(), *FLUSH_FEATURES.keys()]
+                    raise ValueError(f"Unknown feature '{feat}'. Available: {available}")
                 raise ValueError(f"Feature must be string (registry name), callable, got {type(feat)}")
         
         # Final flush
@@ -367,13 +337,13 @@ class OrderbookStore:
         
         # Apply trim/bin if not explicitly ordered
         if not trim_applied and depth is not None:
-            lf = trim_ob(lf, depth)
+            lf, trim_applied = FLUSH_FEATURES['trim'](lf)
             if verbose:
-                print("  - applied default 'trim'")
+                print(f"  - applied default 'trim' ({trim_applied})")
         if not bin_applied and binning is not None:
-            lf = bin_ob(lf, binning)
+            lf, bin_applied = FLUSH_FEATURES['bin'](lf)
             if verbose:
-                print("  - applied default 'bin'")
+                print(f"  - applied default 'bin' ({bin_applied})")
         
         return lf
 
@@ -381,7 +351,7 @@ class OrderbookStore:
             start: Optional[datetime] = None, end: Optional[datetime] = None,
             dates: Optional[list[date]] = None,
             depth: Optional[int] = None, binning: Optional[str] = None, 
-            features: Optional[list] = None, cache_name: Optional[str] = None,
+            features: list = [], cache_name: Optional[str] = None,
             batch_days: Optional[int] = None,
             verbose: bool = False) -> pl.LazyFrame:
         """
@@ -427,6 +397,22 @@ class OrderbookStore:
     # Data Population
     # =============================================================================
 
+    def _log_missing_data(self, date_val: date, inst_family: str, inst_type: str, variant: str):
+        """Log missing data to missing.txt file (avoid duplicates)."""
+        missing_file = self.root / 'missing.txt'
+        entry = f"{date_val.isoformat()},{inst_family},{inst_type},{variant}\n"
+        
+        # Read existing entries if file exists
+        existing_entries = set()
+        if missing_file.exists():
+            with open(missing_file, 'r') as f:
+                existing_entries = set(f.readlines())
+        
+        # Only append if not already present
+        if entry not in existing_entries:
+            with open(missing_file, 'a') as f:
+                f.write(entry)
+
     def _fetch_and_store_single_date(self, inst_family: str, inst_type: str, 
                                      date_val: date, verbose: bool = True) -> tuple[date, bool, str]:
         """
@@ -447,6 +433,7 @@ class OrderbookStore:
             
             # Check if empty
             if temp_dir is None or lf.collect_schema() is None or len(lf.collect_schema()) == 0:
+                self._log_missing_data(date_val, inst_family, inst_type, 'no data returned from API')
                 return (date_val, False, "No data returned from API")
             
             # Write to storage using sink (streaming write, no materialization)
@@ -461,6 +448,7 @@ class OrderbookStore:
             row_count = pl.scan_parquet(path).select(pl.len()).collect().item()
             
             if row_count == 0:
+                self._log_missing_data(date_val, inst_family, inst_type, 'no data after processing')
                 return (date_val, False, "No data after processing")
             
             # Update manifest

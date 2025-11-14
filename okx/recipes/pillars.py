@@ -2,7 +2,7 @@ import polars as pl
 from datetime import date, datetime
 from typing import Optional
 
-from okx.recipes.helpers import early_roll, finalize_binning
+from okx.recipes.helpers import finalize_binning
 
 # =============================================================================
 # Pillar preparation
@@ -17,10 +17,11 @@ def prepare_pillars(
     unique_times: Optional[list[int]] = None,
     drop_pillar_idx: Optional[int] = None,
     batch_days: Optional[int] = None,
+    anchor: str = 'SWAP',  # Must be 'SWAP' or 'SPOT'
     verbose: bool = False,
 ) -> pl.LazyFrame:
     """
-    Prepare concatenated pillar data from SWAP and FUTURES orderbooks.
+    Prepare concatenated pillar data from SWAP/SPOT and FUTURES orderbooks.
 
     Returns a LazyFrame sorted by (timeMs, T) that contains the latest snapshot
     for each instrument at or before every requested timestamp. This keeps the
@@ -29,109 +30,116 @@ def prepare_pillars(
     """
     if not dates:
         return pl.DataFrame().lazy()
+    if binning is not None and unique_times is not None:
+        raise ValueError("Provide either 'binning' for time-based binning or 'unique_times' for explicit timestamps, but not both.")
+    if verbose:
+        start_time = datetime.now()
+        strategy = f'{binning} binning' if binning is not None else f'provided timestamps' if unique_times is not None else 'all timestamps'
+        print(f"Constructing pillars for {inst_family} with {anchor.lower()} and futures using {strategy}")
 
     # =============================================================================
-    # Step 1: Fetch and preprocess swap and futures datasets
+    # Step 1: Fetch and preprocess anchor and futures datasets
     # =============================================================================
-    start_time = datetime.now()
+
     # Build feature list (ordered for performance: strip early to reduce columns)
-    features_base = ['trim', 'strip']
+    features = ['trim', 'strip']
     # using forward fill binning to ensure complete grid for small bin sizes
     # Note: bin_ff creates per-symbol grids only within each symbol's trading range,
     # avoiding null rows before symbols started trading. Forward fill still works
     # over gaps within the trading period.
     if binning:
-        features_base.extend(['bin_ff', finalize_binning])
-    features_base.extend(['rel_spread', 'tenor', 'log'])
-
-    features_swap = [*features_base]
-    features_futures = [*features_base, early_roll(min_time_to_expiry_hours)]
+        features.extend(['bin_ff', finalize_binning])
+    features.extend(['rel_spread', 'tenor', 'log'])
 
     shared_params = {
         'inst_family': inst_family,
         'dates': dates,
         'depth': 1,
+        'features': features,
         'binning': binning,
         'cache_name': f"{'full' if binning is None else binning}_pillars",
         'batch_days': batch_days,
         'verbose': False,
     }
 
-    lf_swap = store.get(
-        inst_type='SWAP',
-        features=features_swap,
+    lf_anchor = store.get(
+        inst_type=anchor,
         **shared_params,
     ).sort('timeMs')
 
     lf_futures = store.get(
         inst_type='FUTURES',
-        features=features_futures,
         **shared_params,
     ).sort(['symbol', 'timeMs'])
 
-    time_1 = datetime.now()
     if verbose:
-        print(f"Time taken to fetch swap and futures: {time_1 - start_time}")
+        time_1 = datetime.now()
+        print(f"Time taken to fetch {anchor.lower()} and futures: {time_1 - start_time}")
 
-    if unique_times is not None:
-        lf_times = pl.DataFrame({'timeMs': sorted(unique_times)}).lazy()
-    else:
-        lf_times = (
-            pl.concat([lf_swap.select('timeMs'), lf_futures.select('timeMs')])
-            .unique().sort('timeMs').lazy()
+    # =============================================================================
+    # Step 2: Align timestamps and apply filters
+    # =============================================================================
+    
+    if binning is None:
+        # No binning - need to align snapshots with join_asof
+        if unique_times is None:
+            # Use union of anchor and futures timeMs
+            lf_times = pl.concat([lf_anchor.select('timeMs'), lf_futures.select('timeMs')]).unique().sort('timeMs').lazy()
+        else:
+            # Use explicitly provided timestamps
+            lf_times = pl.DataFrame({'timeMs': sorted(unique_times)}).lazy()
+        
+        # Align anchor snapshots to target timestamps
+        lf_anchor = (
+            lf_times.join_asof(
+                lf_anchor,
+                on='timeMs',
+                strategy='backward'
+            ).drop('timeMs_right', strict=False)
         )
-
-    # Align swap snapshots to requested timestamps (latest observation <= timeMs)
-    lf_swap_snapshots = (
-        lf_times.join_asof(
-            lf_swap,
-            on='timeMs',
-            strategy='backward',
-            suffix='_hist',
+        
+        # Align futures snapshots to target timestamps (per symbol)
+        lf_symbol_times = (
+            lf_futures.select('symbol').unique()
+            .join(lf_times, how='cross')
+            .sort(['symbol', 'timeMs'])
         )
-        .drop('timeMs_hist', strict=False)
-    )
-
-    lf_valid_times = (
-        lf_swap_snapshots.select('timeMs')
-        .unique()
-        .sort('timeMs')
-    )
-
-    # Align each futures symbol independently using cross join + asof
-    lf_symbol_times = (
-        lf_futures.select('symbol')
-        .unique()
-        .join(lf_valid_times, how='cross')
-        .sort(['symbol', 'timeMs'])
-    )
-    lf_futures_snapshots = (
-        lf_symbol_times.join_asof(
-            lf_futures,
-            on='timeMs',
-            by='symbol',
-            strategy='backward',
-            suffix='_hist',
+        lf_futures = (
+            lf_symbol_times.join_asof(
+                lf_futures,
+                on='timeMs',
+                by='symbol',
+                strategy='backward'
+            ).drop(['symbol_right', 'timeMs_right'], strict=False)
         )
-        .drop(['symbol_hist', 'timeMs_hist'], strict=False)
-        .filter(pl.col('expiry') > pl.col('timeMs'))
-    )
+    
+    # Apply time-to-expiry filters to futures
+    # This prevents: (1) expired contracts, (2) forward-filled stale data in early roll window
+    min_ms = min_time_to_expiry_hours * 3600 * 1000
+    lf_futures = lf_futures.filter((pl.col('expiry') - pl.col('timeMs')) >= min_ms)
     
     if verbose:
-        # Show data quality AFTER filtering nulls
         time_2 = datetime.now()
         print(f"Time taken to align snapshots: {time_2 - time_1}")
 
-    # Ensure consistent column order before concat (LazyFrames don't have .columns)
-    common_cols = ['timeMs', 'symbol', 'rel_spread', 'expiry', 'T', 
-                   'ln_bid_1_px', 'ln_ask_1_px']
-
-    pillars = pl.concat([
-        lf_swap_snapshots.select(common_cols),
-        lf_futures_snapshots.select(common_cols),
-    ])
     # =============================================================================
-    # Step 2: 
+    # Step 3: Concatenate anchor and futures data
+    # =============================================================================
+    
+    pillars = pl.concat([lf_anchor, lf_futures])
+    # Filter to timestamps where both anchor and futures data could exist
+    # Drop early rows where only one data source exists
+    min_anchor_time = lf_anchor.select(pl.col('timeMs').min()).collect().item()
+    min_futures_time = lf_futures.select(pl.col('timeMs').min()).collect().item()
+    cutoff_time = max(min_anchor_time, min_futures_time)
+    pillars = pillars.filter(pl.col('timeMs') >= cutoff_time)
+
+    if verbose:
+        time_3 = datetime.now()
+        print(f"Time taken to concatenate and filter: {time_3 - time_2}")
+    
+    # =============================================================================
+    # Step 4: Add pillar indexing and filtering
     # =============================================================================
 
     pillars = (
@@ -148,8 +156,10 @@ def prepare_pillars(
             pl.col('_pillars_per_time') > drop_pillar_idx
         ).filter(pl.col('pillar_idx') != drop_pillar_idx)
 
-    return (
-        pillars
-        .drop('_pillars_per_time')
-        .sort(['timeMs', 'T'])
-    )
+    pillars = pillars.drop('_pillars_per_time').sort(['timeMs', 'T'])
+    
+    if verbose:
+        end_time = datetime.now()
+        print(f"Total time taken: {end_time - start_time}")
+    
+    return pillars

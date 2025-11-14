@@ -140,9 +140,7 @@ def prepare_options(
         print(f"Time taken to fetch spot: {time_2 - time_1}")
     
     # Calculate spot mid price and match to option timestamps
-    df_spot = df_spot.with_columns(
-        ((pl.col('bid_1_px') + pl.col('ask_1_px')) / 2).alias('spot_mid')
-    ).select(['timeMs', 'spot_mid'])
+    df_spot = df_spot.rename({'mid': 'spot_mid'})
     
     # Join spot prices to options data
     df_options = df_options.join(df_spot, on='timeMs', how='left')

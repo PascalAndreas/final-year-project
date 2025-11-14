@@ -4,10 +4,6 @@ from typing import Optional
 
 from okx.recipes.helpers import finalize_binning
 
-# =============================================================================
-# Pillar preparation
-# =============================================================================
-
 def prepare_pillars(
     store,
     inst_family: str,
@@ -27,9 +23,13 @@ def prepare_pillars(
     for each instrument at or before every requested timestamp. This keeps the
     function compatible with store.get_derived() caching and avoids Python-side
     looping over symbols/timestamps.
+
+    This function is mature, but there stands two potential improvements:
+     - unique_times binning and ff could be pushed upstream to the store.get call, but this would require clever implementation for compatability with batching.
+     - previous day's data could be fetched and processed to ensure early bin/timestamps have full coverage.
     """
     if not dates:
-        return pl.DataFrame().lazy()
+        return pl.LazyFrame()
     if binning is not None and unique_times is not None:
         raise ValueError("Provide either 'binning' for time-based binning or 'unique_times' for explicit timestamps, but not both.")
     if verbose:
@@ -49,6 +49,8 @@ def prepare_pillars(
     # over gaps within the trading period.
     if binning:
         features.extend(['bin_ff', finalize_binning])
+    else:
+        features.extend(['dedupe'])
     features.extend(['rel_spread', 'tenor', 'log'])
 
     shared_params = {
@@ -74,7 +76,7 @@ def prepare_pillars(
 
     if verbose:
         time_1 = datetime.now()
-        print(f"Time taken to fetch {anchor.lower()} and futures: {time_1 - start_time}")
+        print(f" - Time taken to fetch {anchor.lower()} and futures: {time_1 - start_time}")
 
     # =============================================================================
     # Step 2: Align timestamps and apply filters
@@ -120,13 +122,18 @@ def prepare_pillars(
     
     if verbose:
         time_2 = datetime.now()
-        print(f"Time taken to align snapshots: {time_2 - time_1}")
+        print(f" - Time taken to align snapshots: {time_2 - time_1}")
 
     # =============================================================================
     # Step 3: Concatenate anchor and futures data
     # =============================================================================
     
-    pillars = pl.concat([lf_anchor, lf_futures])
+    # Ensure column ordering matches before concatenation
+    pillar_cols = ['symbol', 'timeMs', 'rel_spread', 'expiry', 'T', 'ln_bid_1_px', 'ln_ask_1_px']
+    pillars = pl.concat([
+        lf_anchor.select(pillar_cols),
+        lf_futures.select(pillar_cols)
+    ])
     # Filter to timestamps where both anchor and futures data could exist
     # Drop early rows where only one data source exists
     min_anchor_time = lf_anchor.select(pl.col('timeMs').min()).collect().item()
@@ -136,7 +143,7 @@ def prepare_pillars(
 
     if verbose:
         time_3 = datetime.now()
-        print(f"Time taken to concatenate and filter: {time_3 - time_2}")
+        print(f" - Time taken to concatenate and filter: {time_3 - time_2}")
     
     # =============================================================================
     # Step 4: Add pillar indexing and filtering
@@ -155,11 +162,12 @@ def prepare_pillars(
         pillars = pillars.filter(
             pl.col('_pillars_per_time') > drop_pillar_idx
         ).filter(pl.col('pillar_idx') != drop_pillar_idx)
-
-    pillars = pillars.drop('_pillars_per_time').sort(['timeMs', 'T'])
+    
+    pillars = pillars.drop('_pillars_per_time')
     
     if verbose:
         end_time = datetime.now()
-        print(f"Total time taken: {end_time - start_time}")
+        print(f" - Time taken to index{', drop' if drop_pillar_idx is not None else ''} and sort pillars: {end_time - time_3}")
+        print(f" - Total time taken to prepare pillars: {end_time - start_time}")
     
     return pillars

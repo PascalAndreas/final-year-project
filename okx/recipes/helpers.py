@@ -6,6 +6,8 @@ orderbook processing recipes.
 """
 
 import polars as pl
+from typing import Callable, Optional
+from functools import partial
 
 
 def early_roll(min_time_to_expiry_hours: float):
@@ -23,3 +25,33 @@ def finalize_binning(lf: pl.LazyFrame) -> pl.LazyFrame:
         .with_columns(pl.col('time_bin').dt.epoch('ms').alias('timeMs'))
         .drop('time_bin')
     )
+
+def _format_cache_value(value) -> str:
+    """Format parameter value for cache name (e.g., 5.0 -> '5.0', '5m' -> '5m')."""
+    if isinstance(value, float):
+        return f"{value:.10g}" # Format floats to remove trailing zeros
+    elif isinstance(value, (int, str)):
+        return str(value)
+    elif value is None:
+        return "None"
+    else:
+        return str(value).replace(" ", "") # For other types, use simple string representation
+
+def build_cache_name(binning: str, recipe_type: str, recipe: Callable) -> str:
+    """Build cache name like '{binning|full}_{recipe_type}_{params}' for recipes."""
+    # Recursively extract all parameters from nested partials
+    params = {}
+    while isinstance(recipe, partial):
+        for key, value in (recipe.keywords or {}).items():
+            if key not in params:  # Earlier levels take precedence
+                params[key] = value
+        recipe = recipe.func
+    if params:
+        param_parts = [
+            f"{key}={_format_cache_value(params[key])}"
+            for key in sorted(params)
+        ]
+        params_str = "_" + "_".join(param_parts)
+    else:
+        params_str = ""
+    return f"{binning if binning is not None else 'full'}_{recipe_type}{params_str}"

@@ -89,11 +89,7 @@ class OrderbookStore:
 
     def _date_range(self, start: Optional[datetime] = None, end: Optional[datetime] = None,
                     dates: Optional[list[date]] = None) -> list[date]:
-        """
-        Generate or validate date list.
-        
-        Provide either (start, end) or dates. Returns list of dates.
-        """
+        """Generate or validate date list: provide either (start, end) or dates; returns list of dates."""
         if dates is not None:
             return dates
         if start is None or end is None:
@@ -264,17 +260,17 @@ class OrderbookStore:
             for batch_dates in batch_iter:
                 self._ensure_cached(inst_family, inst_type, batch_dates, builder, cache_name)
             if benchmark:
-                print(f"[benchmark] Cache building: {time.perf_counter() - t0:.3f}s")
+                print(f"  [benchmark] Cache building: {time.perf_counter() - t0:.3f}s")
                 t0 = time.perf_counter()
             result = self._load_from_cache(inst_family, inst_type, dates, cache_name)
             if benchmark:
-                print(f"[benchmark] Cache loading: {time.perf_counter() - t0:.3f}s")
+                print(f"  [benchmark] Cache loading: {time.perf_counter() - t0:.3f}s")
         else:
             # Build batches directly and concatenate
             batch_results = [builder(batch_dates) for batch_dates in batch_iter]
             result = pl.concat(batch_results) if batch_results else pl.LazyFrame()
             if benchmark:
-                print(f"[benchmark] Direct build: {time.perf_counter() - t0:.3f}s")
+                print(f"  [benchmark] Direct build: {time.perf_counter() - t0:.3f}s")
         
         return result
 
@@ -289,13 +285,6 @@ class OrderbookStore:
         """
         if lf.collect_schema() == {}:  # Empty LazyFrame
             return lf
-        
-        if verbose:
-            feature_summary = features if features else ['<default trim/bin>']
-            print(
-                f"[store] Applying transforms for {inst_family}/{inst_type} "
-                f"(depth={depth}, binning={binning}, features={feature_summary})"
-            )
         
         # Helper to benchmark individual transformations (for FLUSH_FEATURES and callables)
         def _benchmark_transform(lf: pl.LazyFrame, feat_name: str) -> pl.LazyFrame:
@@ -388,13 +377,15 @@ class OrderbookStore:
         Features can include feature strings found in features.py or custom callables.
         """
         dates = self._date_range(start, end, dates)
-        
+        if verbose:
+            print(f"[store] Getting {inst_family}/{inst_type} for {len(dates)} dates (depth={depth}, binning={binning}, {len(features)} features)")
         builder = lambda dates_to_build: self._apply_transforms(
             self._scan_raw(inst_family, inst_type, dates_to_build),
             inst_family, inst_type,
             depth, binning, features,
             verbose=verbose, benchmark=benchmark
         )
+        
         return self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, verbose, benchmark)
     
     def get_derived(self, recipe: Callable[[object, list[date]], pl.LazyFrame],
@@ -408,6 +399,8 @@ class OrderbookStore:
         Provide either (start, end) datetimes or a list of dates. If cache_name provided, result is cached.
         """
         dates = self._date_range(start, end, dates)
+        if verbose:
+            print(f"[store] Getting derived data via recipe '{_get_function_name(recipe)}' for {len(dates)} dates")
         builder = lambda dates_to_build: recipe(self, dates_to_build, verbose=verbose)
         return self._get('__derived__', '__derived__', dates, builder, cache_name, batch_days, verbose, benchmark)
     

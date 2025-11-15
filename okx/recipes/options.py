@@ -42,7 +42,7 @@ def prepare_options(
     dates: list[date],
     forwards_recipe: Callable,
     binning: Optional[str] = None,
-    min_time_to_expiry_hours: float = 2.0,
+    batch_days: Optional[int] = None,
     verbose: bool = True,
 ) -> pl.DataFrame:
     """
@@ -92,7 +92,7 @@ def prepare_options(
         options_features.extend(['bin', 'sink_bins'])
     else:
         options_features.extend(['dedupe'])
-    options_features.extend(['tenor', early_roll(min_time_to_expiry_hours), 'parse_option'])
+    options_features.extend(['tenor', 'parse_option'])
 
     df_options = store.get(
         inst_type='OPTION',

@@ -5,6 +5,7 @@ Organized by inst_family/inst_type combos, not individual instruments.
 
 import sqlite3
 import pathlib
+import time
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Callable
@@ -13,6 +14,7 @@ from .api import fetch_orderbook_lazy
 
 from tqdm.auto import tqdm
 from .features import FEATURES, build_flush_features, trim_ob, bin_ob
+from .helpers import _get_function_name
 
 # =============================================================================
 # Manifest
@@ -248,32 +250,37 @@ class OrderbookStore:
              builder: Callable[[list[date]], pl.LazyFrame],
              cache_name: Optional[str] = None,
              batch_days: Optional[int] = None,
-             verbose: bool = False) -> pl.LazyFrame:
+             verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
         """Helper for get() and get_derived() to handle caching logic with optional batching."""
+        # Setup batches (single batch if no batching needed)
         needs_batching = batch_days is not None and len(dates) > batch_days
+        batches = [dates[i:i + batch_days] for i in range(0, len(dates), batch_days)] if needs_batching else [dates]
+        batch_iter = tqdm(batches, desc="Processing batches", disable=not verbose or not needs_batching)
         
-        if not needs_batching:
-            # Process all dates at once
-            self._ensure_cached(inst_family, inst_type, dates, builder, cache_name)
-            return self._load_from_cache(inst_family, inst_type, dates, cache_name) if cache_name else builder(dates)
-        
-        # Process dates in batches
-        batches = [dates[i:i + batch_days] for i in range(0, len(dates), batch_days)]
-        batch_iter = tqdm(batches, desc="Processing batches", disable=not verbose)
-        
+        if benchmark:
+            t0 = time.perf_counter()
         if cache_name:
             # Ensure all batches are cached, then load from cache
             for batch_dates in batch_iter:
                 self._ensure_cached(inst_family, inst_type, batch_dates, builder, cache_name)
-            return self._load_from_cache(inst_family, inst_type, dates, cache_name)
+            if benchmark:
+                print(f"[benchmark] Cache building: {time.perf_counter() - t0:.3f}s")
+                t0 = time.perf_counter()
+            result = self._load_from_cache(inst_family, inst_type, dates, cache_name)
+            if benchmark:
+                print(f"[benchmark] Cache loading: {time.perf_counter() - t0:.3f}s")
         else:
             # Build batches directly and concatenate
             batch_results = [builder(batch_dates) for batch_dates in batch_iter]
-            return pl.concat(batch_results) if batch_results else pl.LazyFrame()
+            result = pl.concat(batch_results) if batch_results else pl.LazyFrame()
+            if benchmark:
+                print(f"[benchmark] Direct build: {time.perf_counter() - t0:.3f}s")
+        
+        return result
 
     def _apply_transforms(self, lf: pl.LazyFrame, inst_family: str, inst_type: str,
                           depth: Optional[int], binning: Optional[str], 
-                          features: list = [], verbose: bool = False) -> pl.LazyFrame:
+                          features: list = [], verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
         """
         Apply transformations in order specified by features list.
         
@@ -290,42 +297,59 @@ class OrderbookStore:
                 f"(depth={depth}, binning={binning}, features={feature_summary})"
             )
         
-        # Helper to flush accumulated feature expressions
-        def _flush(frame: pl.LazyFrame, exprs: list) -> tuple[pl.LazyFrame, list]:
-            if exprs:
-                frame = frame.with_columns(exprs)
-            return frame, []
+        # Helper to benchmark individual transformations (for FLUSH_FEATURES and callables)
+        def _benchmark_transform(lf: pl.LazyFrame, feat_name: str) -> pl.LazyFrame:
+            if not benchmark:
+                return lf
+            t0 = time.perf_counter()
+            lf = lf.collect().lazy()
+            elapsed = time.perf_counter() - t0
+            print(f"  [benchmark] {feat_name}: {elapsed:.3f}s")
+            return lf
+
+        # Helper to flush accumulated feature names with optional benchmarking
+        def _flush(lf: pl.LazyFrame, feat_names: list) -> tuple[pl.LazyFrame, list]:
+            if feat_names:
+                exprs = [FEATURES[name].alias(name) for name in feat_names]
+                lf = lf.with_columns(exprs)
+                if benchmark:
+                    names = ', '.join(feat_names) if len(feat_names) > 1 else feat_names[0]
+                    lf = _benchmark_transform(lf, names)
+            return lf, []
         
         # Callable features that require flushing before execution
         FLUSH_FEATURES = build_flush_features(depth, binning, inst_type)
         
         # Process features list in order
-        trim_applied = False
-        bin_applied = False
-        feature_exprs = []
+        trim_applied, bin_applied = False, False
+        feature_names = []
         
         for feat in features:
             if feat in FLUSH_FEATURES:
-                # Flush accumulated expressions, then apply the transformation
-                lf, feature_exprs = _flush(lf, feature_exprs)
+                # Flush accumulated features, then apply the transformation
+                lf, feature_names = _flush(lf, feature_names)
                 lf, was_applied = FLUSH_FEATURES[feat](lf)
-                if verbose and was_applied:
-                    print(f"  - applied '{feat}'")
+                if was_applied:
+                    if verbose:
+                        print(f"  - applied '{feat}'")
+                    lf = _benchmark_transform(lf, feat)
                 # Track trim/bin application for default fallback
                 if feat == 'trim':
                     trim_applied = was_applied
                 elif feat.startswith('bin'):
                     bin_applied = was_applied
             elif feat in FEATURES:
-                # Registry feature
-                feature_exprs.append(FEATURES[feat].alias(feat))
+                # Registry feature - accumulate for parallel execution
+                feature_names.append(feat)
                 if verbose:
                     print(f"  - applied '{feat}'")
             elif callable(feat):
-                lf, feature_exprs = _flush(lf, feature_exprs)
+                lf, feature_names = _flush(lf, feature_names)
                 lf = feat(lf)
+                feat_name = _get_function_name(feat)
+                lf = _benchmark_transform(lf, feat_name)
                 if verbose:
-                    print(f"  - applied '{feat.__name__}'")
+                    print(f"  - applied '{feat_name}'")
             else:
                 if isinstance(feat, str):
                     available = [*FEATURES.keys(), *FLUSH_FEATURES.keys()]
@@ -333,17 +357,21 @@ class OrderbookStore:
                 raise ValueError(f"Feature must be string (registry name), callable, got {type(feat)}")
         
         # Final flush
-        lf, feature_exprs = _flush(lf, feature_exprs)
+        lf, feature_names = _flush(lf, feature_names)
         
         # Apply trim/bin if not explicitly ordered
         if not trim_applied and depth is not None:
             lf, trim_applied = FLUSH_FEATURES['trim'](lf)
-            if verbose:
-                print(f"  - applied default 'trim' ({trim_applied})")
+            if trim_applied:
+                if verbose:
+                    print(f"  - applied default 'trim'")
+                lf = _benchmark_transform(lf, 'trim (default)')
         if not bin_applied and binning is not None:
             lf, bin_applied = FLUSH_FEATURES['bin'](lf)
-            if verbose:
-                print(f"  - applied default 'bin' ({bin_applied})")
+            if bin_applied:
+                if verbose:
+                    print(f"  - applied default 'bin'")
+                lf = _benchmark_transform(lf, 'bin (default)')
         
         return lf
 
@@ -353,16 +381,11 @@ class OrderbookStore:
             depth: Optional[int] = None, binning: Optional[str] = None, 
             features: list = [], cache_name: Optional[str] = None,
             batch_days: Optional[int] = None,
-            verbose: bool = False) -> pl.LazyFrame:
+            verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
         """
-        Get orderbook data with optional transformations.
-        
-        Provide either (start, end) or dates. Features can include registry names,
-        callables, 'trim', or 'bin'. If cache_name provided, result is cached.
-        
-        Args:
-            batch_days: If set, process dates in batches of this size to avoid memory issues.
-                       Only applies when number of dates exceeds this threshold.
+        Get orderbook data with transformations.
+        Provide either (start, end) datetimes or a list of dates. If cache_name provided, result is cached.
+        Features can include feature strings found in features.py or custom callables.
         """
         dates = self._date_range(start, end, dates)
         
@@ -370,28 +393,23 @@ class OrderbookStore:
             self._scan_raw(inst_family, inst_type, dates_to_build),
             inst_family, inst_type,
             depth, binning, features,
-            verbose=verbose,
+            verbose=verbose, benchmark=benchmark
         )
-        return self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, verbose)
+        return self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, verbose, benchmark)
     
     def get_derived(self, recipe: Callable[[object, list[date]], pl.LazyFrame],
                     start: Optional[datetime] = None, end: Optional[datetime] = None,
                     dates: Optional[list[date]] = None,
                     cache_name: Optional[str] = None,
                     batch_days: Optional[int] = None,
-                    verbose: bool = False) -> pl.LazyFrame:
+                    verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
         """
-        Get derived data via recipe function with signature (store, dates) -> LazyFrame.
-        
-        Provide either (start, end) or dates. If cache_name provided, result is cached.
-        
-        Args:
-            batch_days: If set, process dates in batches of this size to avoid memory issues.
-                       Only applies when number of dates exceeds this threshold.
+        Get derived data via recipe function with signature (store, dates, verbose) -> LazyFrame.
+        Provide either (start, end) datetimes or a list of dates. If cache_name provided, result is cached.
         """
         dates = self._date_range(start, end, dates)
         builder = lambda dates_to_build: recipe(self, dates_to_build, verbose=verbose)
-        return self._get('__derived__', '__derived__', dates, builder, cache_name, batch_days, verbose)
+        return self._get('__derived__', '__derived__', dates, builder, cache_name, batch_days, verbose, benchmark)
     
     # =============================================================================
     # Data Population

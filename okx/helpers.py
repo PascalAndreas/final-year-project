@@ -1,10 +1,23 @@
 from datetime import datetime, timezone
+from typing import Callable
+from functools import partial
 import pandas as pd
 import numpy as np
 import polars as pl
 
 # ===============================================================
-# Name parsing functions
+# Helper functions
+# ===============================================================
+
+def _get_function_name(func: Callable) -> str:
+    """Extract function name from function, handles nested functools.partial."""
+    while isinstance(func, partial):
+        func = func.func
+    func_name = func.__name__
+    return func_name
+
+# ===============================================================
+# Name parsing functions - superceded by polars features, slated for deprecation
 # ===============================================================
 
 def parse_option_name(instrument_name: str):
@@ -32,6 +45,10 @@ def parse_future_name(instrument_name: str):
     expiry_datetime = datetime.strptime(parts[2], '%y%m%d').replace(hour=8, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
     
     return f"{parts[0]}-{parts[1]}", expiry_datetime
+
+# ===============================================================
+# LEGACY PANDAS FUNCTIONS - slated for deprecation
+# ===============================================================
 
 def get_option_combos(df: pl.DataFrame | pl.LazyFrame):
     """Extract unique expiry/strike combinations from options data.
@@ -63,9 +80,38 @@ def get_option_combos(df: pl.DataFrame | pl.LazyFrame):
             .unique()
             .sort(['expiry', 'strike']))
 
-# ===============================================================
-# Orderbook processing functions (pandas)
-# ===============================================================
+def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
+    """
+    Trim orderbook DataFrame to keep only top n levels.
+    If n_levels=0, calculates simple mid price (bid_1 + ask_1) / 2 and drops all orderbook columns.
+    Expects OPTIONS format column names (ask_1_px, bid_1_px, etc.)
+    """
+    if n_levels == 0:
+        # Return empty if required columns don't exist
+        if 'bid_1_px' not in df.columns or 'ask_1_px' not in df.columns:
+            base_cols = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
+            return pd.DataFrame(columns=base_cols + ['mid_price'])
+        
+        # Filter out rows with NaN bid or ask
+        df = df[df['bid_1_px'].notna() & df['ask_1_px'].notna()].copy()
+        
+        # Return empty if no valid rows
+        if df.empty:
+            base_cols = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
+            return pd.DataFrame(columns=base_cols + ['mid_price'])
+        
+        # Calculate mid price and keep only non-orderbook columns
+        df['mid_price'] = (df['bid_1_px'] + df['ask_1_px']) / 2
+        cols_to_keep = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
+        return df[cols_to_keep]
+    
+    # Standard trimming to n levels
+    cols_to_keep = [
+        col for col in df.columns
+        if not any(col.startswith(f'{side}_') for side in ['ask', 'bid']) or
+        (col.split('_')[1].isdigit() and int(col.split('_')[1]) <= n_levels)
+    ]
+    return df[cols_to_keep]
 
 def bin_orderbook(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     """Bin orderbook timestamps and keep most recent entry per time bin per symbol.
@@ -121,36 +167,4 @@ def standardize_orderbook_columns(df: pd.DataFrame, filename: str) -> pd.DataFra
     return df.rename(columns=rename_map)
 
 
-def trim_orderbook(df: pd.DataFrame, n_levels: int = 5):
-    """
-    Trim orderbook DataFrame to keep only top n levels.
-    If n_levels=0, calculates simple mid price (bid_1 + ask_1) / 2 and drops all orderbook columns.
-    Expects OPTIONS format column names (ask_1_px, bid_1_px, etc.)
-    """
-    if n_levels == 0:
-        # Return empty if required columns don't exist
-        if 'bid_1_px' not in df.columns or 'ask_1_px' not in df.columns:
-            base_cols = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
-            return pd.DataFrame(columns=base_cols + ['mid_price'])
-        
-        # Filter out rows with NaN bid or ask
-        df = df[df['bid_1_px'].notna() & df['ask_1_px'].notna()].copy()
-        
-        # Return empty if no valid rows
-        if df.empty:
-            base_cols = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
-            return pd.DataFrame(columns=base_cols + ['mid_price'])
-        
-        # Calculate mid price and keep only non-orderbook columns
-        df['mid_price'] = (df['bid_1_px'] + df['ask_1_px']) / 2
-        cols_to_keep = [col for col in df.columns if not any(col.startswith(f'{side}_') for side in ['ask', 'bid'])]
-        return df[cols_to_keep]
-    
-    # Standard trimming to n levels
-    cols_to_keep = [
-        col for col in df.columns
-        if not any(col.startswith(f'{side}_') for side in ['ask', 'bid']) or
-        (col.split('_')[1].isdigit() and int(col.split('_')[1]) <= n_levels)
-    ]
-    return df[cols_to_keep]
 

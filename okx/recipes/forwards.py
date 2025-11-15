@@ -24,6 +24,7 @@ from forwards.pchip import fit_pchip_curve, ewma_smooth, curves_to_polars
 from forwards.kalman_ns import kalman_filter, states_to_polars
 from okx.recipes.pillars import prepare_pillars
 from okx.recipes.helpers import build_cache_name
+from okx.helpers import _get_function_name
 from tqdm import tqdm
 
 # =============================================================================
@@ -259,10 +260,8 @@ def build_forwards_kalman(
 # =============================================================================
 
 def _get_recipe_type(recipe: Callable) -> str:
-    """Extract function name from recipe, handles nested functools.partial."""
-    while isinstance(recipe, partial):
-        recipe = recipe.func
-    recipe_name = recipe.__name__.lower()
+    """Extract function name from recipe, handles nested functools.partial. via okx.helpers._get_function_name"""
+    recipe_name = _get_function_name(recipe).lower()
     if 'pchip' in recipe_name:
         return 'pchip'
     elif 'kalman' in recipe_name:

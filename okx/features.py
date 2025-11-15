@@ -33,6 +33,8 @@ def build_flush_features(depth: Optional[int], binning: Optional[str], inst_type
         'bin_count_ff': (lambda lf: (bin_ob(lf, binning, count=True, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
         'bin_ff_count': (lambda lf: (bin_ob(lf, binning, count=True, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
         'sink_bins': lambda lf: (sink_bins(lf), True),
+        'times_to_dt': lambda lf: (times_to_dt(lf), True),
+        'times_to_ms': lambda lf: (times_to_ms(lf), True),
         'tenor': lambda lf: (add_tenor(lf, inst_type), True),
         'log': lambda lf: (log_prices(lf), True),
         'exp': lambda lf: (exp_prices(lf), True),
@@ -44,7 +46,7 @@ def build_flush_features(depth: Optional[int], binning: Optional[str], inst_type
     }
 
 # ===============================================================
-# Basic orderbook processing functions
+# Column removal functions
 # ===============================================================
 
 def trim_ob(lf: pl.LazyFrame, n_levels: int = 5) -> pl.LazyFrame:
@@ -81,6 +83,10 @@ def strip_ob(lf: pl.LazyFrame) -> pl.LazyFrame:
     ]
     keep_cols.extend([col for col in keep_if_present if col in cols])
     return lf.select(keep_cols)
+
+# ===============================================================
+# Binning functions
+# ===============================================================
 
 def bin_ob(lf: pl.LazyFrame, freq: str, count: bool = False, ff: bool = False) -> pl.LazyFrame:
     """
@@ -158,6 +164,32 @@ def sink_bins(lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 # ===============================================================
+# Timestamp functions
+# ===============================================================
+
+def _get_time_cols(lf: pl.LazyFrame) -> list[str]:
+    """Get all time columns from LazyFrame."""
+    schema = lf.collect_schema()
+    return [
+        col for col in schema.names()
+        if ('time' in col.lower() or col == 'expiry') and schema[col] in [pl.Int64, pl.Int32, pl.UInt64, pl.UInt32]
+    ]
+
+def times_to_dt(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Convert time columns from milliseconds (Int64) to datetime."""
+    time_cols = _get_time_cols(lf)
+    if not time_cols:
+        return lf
+    return lf.with_columns([pl.col(col).cast(pl.Datetime('ms')) for col in time_cols])
+
+def times_to_ms(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Convert time columns from datetime to milliseconds (Int64)."""
+    time_cols = _get_time_cols(lf)
+    if not time_cols:
+        return lf
+    return lf.with_columns([pl.col(col).dt.timestamp('ms').alias(col) for col in time_cols])
+
+# ===============================================================
 # Price transformation functions
 # ===============================================================
 
@@ -213,39 +245,35 @@ def drop_nulls(lf: pl.LazyFrame) -> pl.LazyFrame:
 # ===============================================================
 # Symbol parsing features
 # ===============================================================
+# TODO: Benchmark the two parse_option functions and use the faster one.
 
 def parse_option(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """
-    Parse option symbols to add strike and opt_type columns.
-    
-    Adds:
-        - strike: Strike price (int)
-        - opt_type: 'C' for call, 'P' for put
-    
-    Note: Does NOT add moneyness (requires spot reference from separate data source).
-    
-    Symbol format: BTC-USD-250627-200000-C (currency-date-strike-type)
-    """
+    """Parse option symbols to add 'strike' and 'opt_type' columns."""
+    # Symbol format: BTC-USD-250627-200000-C (currency-date-strike-type)
     # Remove file extension if present (e.g., '.OK') and split by '-'
     # Using vectorized string operations - much faster than map_elements
     return lf.with_columns([
         # Extract strike (4th element after split, index 3)
         pl.col('symbol')
-          .str.split('.')
-          .list.first()  # Remove extension
-          .str.split('-')
-          .list.get(3)
+          .str.split('.').list.first() # Remove extension
+          .str.split('-').list.get(3)
           .cast(pl.Int64)
           .alias('strike'),
         # Extract option type (5th element after split, index 4)
         pl.col('symbol')
-          .str.split('.')
-          .list.first()
-          .str.split('-')
-          .list.get(4)
+          .str.split('.').list.first() # Remove extension
+          .str.split('-').list.get(4)
           .str.to_uppercase()
           .alias('opt_type'),
     ])
+
+def parse_option_v2(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.with_columns(
+        pl.col('symbol')
+            .str.split('.').list.first() # Remove extension
+            .str.split('-')
+            .alias('_parts')
+    ).with_columns([pl.col('_parts').list.get(3).cast(pl.Int64).alias('strike'), pl.col('_parts').list.get(4).str.to_uppercase().alias('opt_type')]).drop('_parts')
 
 def add_tenor(lf: pl.LazyFrame, inst_type: str) -> pl.LazyFrame:
     """

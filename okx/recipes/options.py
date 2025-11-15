@@ -23,7 +23,7 @@ import polars as pl
 from datetime import date, datetime
 from typing import Callable, Optional
 
-from okx.recipes.helpers import early_roll, finalize_binning
+from okx.recipes.helpers import early_roll
 from okx.recipes.forwards import assign_forwards
 
 CONTRACT_MULTIPLIERS = {
@@ -89,7 +89,7 @@ def prepare_options(
 
     options_features = ['trim', 'strip', 'nullify']
     if binning:
-        options_features.extend(['bin', finalize_binning])
+        options_features.extend(['bin', 'sink_bins'])
     else:
         options_features.extend(['dedupe'])
     options_features.extend(['tenor', early_roll(min_time_to_expiry_hours), 'parse_option'])
@@ -117,7 +117,7 @@ def prepare_options(
     
     spot_features = ['trim', 'strip', 'nullify']
     if binning:
-        spot_features.extend(['bin', finalize_binning])
+        spot_features.extend(['bin', 'sink_bins'])
     else:
         spot_features.extend(['dedupe'])
     

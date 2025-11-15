@@ -2,8 +2,6 @@ import polars as pl
 from datetime import date, datetime
 from typing import Optional
 
-from okx.recipes.helpers import finalize_binning
-
 def prepare_pillars(
     store,
     inst_family: str,
@@ -48,7 +46,7 @@ def prepare_pillars(
     # avoiding null rows before symbols started trading. Forward fill still works
     # over gaps within the trading period.
     if binning:
-        features.extend(['bin_ff', finalize_binning])
+        features.extend(['bin_ff', 'sink_bins'])
     else:
         features.extend(['dedupe'])
     features.extend(['rel_spread', 'tenor', 'log'])

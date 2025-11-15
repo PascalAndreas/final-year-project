@@ -32,6 +32,7 @@ def build_flush_features(depth: Optional[int], binning: Optional[str], inst_type
         'bin_ff': (lambda lf: (bin_ob(lf, binning, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
         'bin_count_ff': (lambda lf: (bin_ob(lf, binning, count=True, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
         'bin_ff_count': (lambda lf: (bin_ob(lf, binning, count=True, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
+        'sink_bins': lambda lf: (sink_bins(lf), True),
         'tenor': lambda lf: (add_tenor(lf, inst_type), True),
         'log': lambda lf: (log_prices(lf), True),
         'exp': lambda lf: (exp_prices(lf), True),
@@ -102,7 +103,7 @@ def bin_ob(lf: pl.LazyFrame, freq: str, count: bool = False, ff: bool = False) -
         .sort(['symbol', '_ts'])
         .group_by_dynamic('_ts', every=freq, group_by='symbol', closed='right', label='right')
         .agg(agg_exprs)
-        .with_columns(pl.col('_ts').alias('time_bin'))
+        .with_columns(pl.col('_ts').dt.timestamp('ms').alias('time_bin'))
         .drop('_ts')
     )
     
@@ -148,6 +149,13 @@ def bin_ob(lf: pl.LazyFrame, freq: str, count: bool = False, ff: bool = False) -
             binned = binned.with_columns(pl.col('bin_count').fill_null(0))
     
     return binned
+
+def sink_bins(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Sink time_bin into timeMs by dropping old timeMs and renaming time_bin."""
+    return (lf
+        .drop('timeMs')
+        .rename({'time_bin': 'timeMs'})
+    )
 
 # ===============================================================
 # Price transformation functions

@@ -8,8 +8,8 @@ import polars as pl
 
 def compute_option_parity_table(
     df_options: pl.DataFrame,
-    min_moneyness: float = 0.9,
-    max_moneyness: float = 1.1,
+    min_moneyness: float = -0.05,
+    max_moneyness: float = 0.05,
 ) -> pl.DataFrame:
     """Build call/put pairs with fitted/implied forward diagnostics."""
     if df_options.is_empty():

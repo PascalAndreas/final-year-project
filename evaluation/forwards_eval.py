@@ -143,6 +143,7 @@ def _assign_errors(lf_fitted: pl.LazyFrame) -> pl.LazyFrame:
 # =============================================================================
 # Pillar Fit and LOEO Evaluation Functions
 # =============================================================================
+
 def evaluate_pillar_fit(
     store,
     dates: list[date],

@@ -13,6 +13,9 @@ from typing import Optional, Tuple, List
 from .pchip import PCHIPCurve, reconstruct_forward
 from .kalman_ns import NSCarryState, reconstruct_ns_forward
 
+# =============================================================================
+# PCHIP Plotting Functions
+# =============================================================================
 
 def plot_pchip_snapshot(
     df_pchip: pl.DataFrame,
@@ -67,6 +70,9 @@ def plot_pchip_snapshot(
     
     return ax
 
+# =============================================================================
+# Kalman NS Plotting Functions
+# =============================================================================
 
 def plot_kalman_snapshot(
     state: NSCarryState,
@@ -116,7 +122,6 @@ def plot_kalman_snapshot(
     
     return ax
 
-
 def plot_ns_factors(
     df_kalman: pl.DataFrame,
     ax: Optional[plt.Axes] = None,
@@ -151,6 +156,9 @@ def plot_ns_factors(
     
     return ax
 
+# =============================================================================
+# Comparison Plotting Functions
+# =============================================================================
 
 def plot_forward_tracking(
     df_pchip_track: pl.DataFrame,
@@ -199,96 +207,6 @@ def plot_forward_tracking(
     }
     
     return ax, stats
-
-
-def plot_error_distribution(
-    errors: np.ndarray,
-    method_name: str,
-    ax: Optional[plt.Axes] = None,
-    bins: int = 50
-) -> plt.Axes:
-    """
-    Plot error distribution histogram with stats.
-    
-    Args:
-        errors: Array of errors
-        method_name: Name of the method (for title)
-        ax: Optional axes to plot on
-        bins: Number of histogram bins
-        
-    Returns:
-        The axes object
-    """
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(10, 5))
-    
-    ax.hist(errors, bins=bins, alpha=0.7, edgecolor='black', color='steelblue')
-    
-    # Add vertical lines for mean and median
-    mean_err = np.mean(errors)
-    median_err = np.median(errors)
-    
-    ax.axvline(mean_err, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_err:.2f}')
-    ax.axvline(median_err, color='green', linestyle='--', linewidth=2, label=f'Median: {median_err:.2f}')
-    
-    ax.set_xlabel('Error (USD)', fontsize=11)
-    ax.set_ylabel('Count', fontsize=11)
-    ax.set_title(f'{method_name} - Error Distribution', fontsize=13)
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    return ax
-
-
-def plot_spread_analysis(
-    df_curves: pl.DataFrame,
-    ax: Optional[plt.Axes] = None,
-    title: str = 'Bid-Ask Spread Analysis'
-) -> plt.Axes:
-    """
-    Plot bid-ask spread over maturity.
-    
-    Args:
-        df_curves: DataFrame with forward curves (must have T, F_bid, F_ask)
-        ax: Optional axes to plot on
-        title: Plot title
-        
-    Returns:
-        The axes object
-    """
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(12, 6))
-    
-    # Compute spread
-    df_spread = df_curves.with_columns([
-        ((pl.col('F_ask') - pl.col('F_bid')) / pl.col('F_bid') * 10000).alias('spread_bps')
-    ])
-    
-    # Group by T and compute statistics
-    spread_stats = df_spread.group_by('T').agg([
-        pl.col('spread_bps').mean().alias('mean_spread'),
-        pl.col('spread_bps').std().alias('std_spread'),
-        pl.col('spread_bps').quantile(0.25).alias('q25_spread'),
-        pl.col('spread_bps').quantile(0.75).alias('q75_spread'),
-    ]).sort('T')
-    
-    T_vals = spread_stats['T'].to_numpy()
-    mean_vals = spread_stats['mean_spread'].to_numpy()
-    std_vals = spread_stats['std_spread'].to_numpy()
-    q25_vals = spread_stats['q25_spread'].to_numpy()
-    q75_vals = spread_stats['q75_spread'].to_numpy()
-    
-    ax.plot(T_vals, mean_vals, 'b-', linewidth=2, label='Mean Spread')
-    ax.fill_between(T_vals, q25_vals, q75_vals, alpha=0.3, label='25th-75th Percentile')
-    
-    ax.set_xlabel('Time to Maturity (years)', fontsize=11)
-    ax.set_ylabel('Spread (bps)', fontsize=11)
-    ax.set_title(title, fontsize=13)
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    
-    return ax
-
 
 def create_comparison_figure(
     df_pchip: pl.DataFrame,

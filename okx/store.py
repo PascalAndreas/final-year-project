@@ -13,7 +13,7 @@ import polars as pl
 from .api import fetch_orderbook_lazy
 
 from tqdm.auto import tqdm
-from .features import FEATURES, build_flush_features, trim_ob, bin_ob
+from .features import FEATURES, build_flush_features, sink_bins
 from .helpers import _get_function_name
 
 # =============================================================================
@@ -121,7 +121,8 @@ class OrderbookStore:
         if not paths:
             return pl.LazyFrame()
         
-        return pl.scan_parquet(paths)
+        # Raw data is sorted by timeMs (enforced at populate time)
+        return pl.scan_parquet(paths).set_sorted('timeMs')
 
     def _write_cache(self, lf: pl.LazyFrame, dates: list[date], cache_name: str,
                      inst_family: str, inst_type: str) -> None:
@@ -276,7 +277,9 @@ class OrderbookStore:
 
     def _apply_transforms(self, lf: pl.LazyFrame, inst_family: str, inst_type: str,
                           depth: Optional[int], binning: Optional[str], 
-                          features: list = [], verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
+                          unique_times: Optional[list[int]], 
+                          features: list = [], 
+                          verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
         """
         Apply transformations in order specified by features list.
         
@@ -307,7 +310,7 @@ class OrderbookStore:
             return lf, []
         
         # Callable features that require flushing before execution
-        FLUSH_FEATURES = build_flush_features(depth, binning, inst_type)
+        FLUSH_FEATURES = build_flush_features(inst_type, depth, binning, unique_times)
         
         # Process features list in order
         trim_applied, bin_applied = False, False
@@ -368,6 +371,7 @@ class OrderbookStore:
             start: Optional[datetime] = None, end: Optional[datetime] = None,
             dates: Optional[list[date]] = None,
             depth: Optional[int] = None, binning: Optional[str] = None, 
+            unique_times: Optional[list[int]] = None,
             features: list = [], cache_name: Optional[str] = None,
             batch_days: Optional[int] = None,
             verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
@@ -376,17 +380,44 @@ class OrderbookStore:
         Provide either (start, end) datetimes or a list of dates. If cache_name provided, result is cached.
         Features can include feature strings found in features.py or custom callables.
         """
+        if binning is not None and unique_times is not None:
+            raise ValueError("Provide either 'binning' or 'unique_times', not both")
+
         dates = self._date_range(start, end, dates)
         if verbose:
-            print(f"[store] Getting {inst_family}/{inst_type} for {len(dates)} dates (depth={depth}, binning={binning}, {len(features)} features)")
+            strategy = f'{binning} binning' if binning is not None else 'provided timestamps'
+            print(f"[store] Getting {inst_family}/{inst_type} for {len(dates)} dates (depth={depth}, {strategy}, {len(features)} features)")
+
+        # Check for sink_bins_after - remove it from features and apply at the end
+        apply_sink_bins_after = 'sink_bins_after' in features
+        if apply_sink_bins_after:
+            features = [f for f in features if f != 'sink_bins_after']
+        
+        # Build batches
         builder = lambda dates_to_build: self._apply_transforms(
             self._scan_raw(inst_family, inst_type, dates_to_build),
             inst_family, inst_type,
-            depth, binning, features,
+            depth, binning, unique_times, features,
             verbose=verbose, benchmark=benchmark
         )
+        result = self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, 
+                          verbose, benchmark)
         
-        return self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, verbose, benchmark)
+        # Deduplicate if using forward fill with batching (to handle overlapping bins at batch edges)
+        using_ff = any('ff' in str(f) for f in features)
+        batching = batch_days is not None and len(dates) > batch_days
+        if using_ff and batching and apply_sink_bins_after:
+            t0 = time.perf_counter()
+            result = result.unique(subset=['symbol', 'time_bin'], keep='last', maintain_order=True)
+            print(f"  [benchmark] Deduplication: {time.perf_counter() - t0:.3f}s")
+        
+        # Apply sink_bins after batching if requested
+        if apply_sink_bins_after:
+            t0 = time.perf_counter()
+            result = sink_bins(result)
+            print(f"  [benchmark] Sink bins: {time.perf_counter() - t0:.3f}s")
+        
+        return result
     
     def get_derived(self, recipe: Callable[[object, list[date]], pl.LazyFrame],
                     start: Optional[datetime] = None, end: Optional[datetime] = None,
@@ -447,12 +478,12 @@ class OrderbookStore:
                 self._log_missing_data(date_val, inst_family, inst_type, 'no data returned from API')
                 return (date_val, False, "No data returned from API")
             
-            # Write to storage using sink (streaming write, no materialization)
+            # Sort by timeMs and write to storage using sink (streaming write, no materialization)
             path = self._path_for(inst_family, inst_type, date_val, 'raw')
             path.parent.mkdir(parents=True, exist_ok=True)
             
             tmp_path = path.with_suffix('.parquet.tmp')
-            lf.sink_parquet(str(tmp_path), compression='zstd')
+            lf.sort('timeMs').sink_parquet(str(tmp_path), compression='zstd')
             tmp_path.rename(path)
             
             # Get row count (lightweight scan)

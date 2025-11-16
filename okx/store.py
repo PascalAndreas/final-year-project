@@ -392,12 +392,6 @@ class OrderbookStore:
         if verbose:
             strategy = f'{binning} binning' if binning is not None else 'provided timestamps'
             print(f"[store] Getting {inst_family}/{inst_type} for {len(dates)} dates (depth={depth}, {strategy}, {len(features)} features)")
-
-        # Check for sink_bins_after - remove it from features and apply at the end
-        apply_sink_bins_after = 'sink_bins_after' in features
-        if apply_sink_bins_after:
-            features = [f for f in features if f != 'sink_bins_after']
-        print(f"Applying sink bins after: {apply_sink_bins_after}")
         
         # Build batches
         builder = lambda dates_to_build: self._apply_transforms(
@@ -409,30 +403,18 @@ class OrderbookStore:
         result = self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, 
                           verbose, benchmark)
         
+        # Handle forward fill boundary conditions
         # Deduplicate if using forward fill with batching (to handle overlapping bins at batch edges)
         using_ff = any('ff' in str(f) for f in features)
-        print(f"Using forward fill: {using_ff}")
         batching = batch_days is not None and len(dates) > batch_days
-        print(f"Batching: {batching}")
-        if using_ff and batching:
-            t0 = time.perf_counter()
-            print(f"  Rows before deduplication: {result.select(pl.len()).collect().item()}")
+        if using_ff:
             cols = result.collect_schema().names()
-            if 'time_bin' in cols:
-                result = result.unique(subset=['symbol', 'time_bin'], keep='last', maintain_order=True).collect().lazy()
-                print(f"  Deduplicated by time_bin")
-            else:
-                result = result.unique(subset=['symbol', 'timeMs'], keep='last', maintain_order=True).collect().lazy()
-                print(f"  Deduplicated by timeMs")
-            print(f"  [benchmark] Deduplication: {time.perf_counter() - t0:.3f}s")
-            print(f"  Rows after deduplication: {result.select(pl.len()).collect().item()}")
-        # Apply sink_bins after batching if requested
-        if apply_sink_bins_after:
-            t0 = time.perf_counter()
-            result = sink_bins(result)
-            print(f"  [benchmark] Sink bins: {time.perf_counter() - t0:.3f}s")
-        if benchmark_fn is not None:
-            benchmark_fn(result.collect())
+            time_col = 'time_bin' if 'time_bin' in cols else 'timeMs'
+            end_dt = datetime.combine(dates[-1], datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
+            end_ms = int(end_dt.timestamp() * 1000)
+            result = result.filter(pl.col(time_col) <= end_ms)
+            if batching:
+                result = result.unique(subset=['symbol', time_col], keep='last', maintain_order=True)
 
         return result
     

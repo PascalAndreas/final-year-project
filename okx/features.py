@@ -2,6 +2,8 @@ import polars as pl
 from okx.helpers import parse_option_name, parse_future_name
 from datetime import datetime
 from typing import Optional, Callable
+from datetime import datetime, timezone, timedelta
+import time
 
 # =============================================================================
 # Feature registry (expressions and flush features)
@@ -42,23 +44,11 @@ def build_flush_features(
     return {
         # Original binning (uses group_by_dynamic)
         'trim': (lambda lf: (trim_ob(lf, depth), True)) if depth is not None else (lambda lf: (lf, False)),
-        'bin': (lambda lf: (bin_ob(lf, binning), True)) if binning is not None else (lambda lf: (lf, False)),
-        'bin_count': (lambda lf: (bin_ob(lf, binning, count=True), True)) if binning is not None else (lambda lf: (lf, False)),
-        'bin_ff': (lambda lf: (bin_ob(lf, binning, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
-        'bin_count_ff': (lambda lf: (bin_ob(lf, binning, count=True, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
-        'bin_ff_count': (lambda lf: (bin_ob(lf, binning, count=True, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
-        
-        # V2 binning (uses join_asof) - infers time bins from data
-        'bin_v2': (lambda lf: (bin_ob_v2(lf, binning), True)) if binning is not None else (lambda lf: (lf, False)),
-        'bin_v2_count': (lambda lf: (bin_ob_v2(lf, binning, count=True), True)) if binning is not None else (lambda lf: (lf, False)),
-        'bin_v2_ff': (lambda lf: (bin_ob_v2(lf, binning, ff=True), True)) if binning is not None else (lambda lf: (lf, False)),
-        'bin_v2_ff_count': (lambda lf: (bin_ob_v2(lf, binning, ff=True, count=True), True)) if binning is not None else (lambda lf: (lf, False)),
-        
-        # Bin to explicit times - infers range from data
-        'bin_to_times': (lambda lf: (bin_by_times(lf, unique_times), True)) if unique_times is not None else (lambda lf: (lf, False)),
-        'bin_to_times_count': (lambda lf: (bin_by_times(lf, unique_times, count=True), True)) if unique_times is not None else (lambda lf: (lf, False)),
-        'bin_to_times_ff': (lambda lf: (bin_by_times(lf, unique_times, ff=True), True)) if unique_times is not None else (lambda lf: (lf, False)),
-        'bin_to_times_ff_count': (lambda lf: (bin_by_times(lf, unique_times, ff=True, count=True), True)) if unique_times is not None else (lambda lf: (lf, False)),
+        'bin': lambda lf: bin_ob(lf, binning, unique_times),
+        'bin_count': lambda lf: bin_ob(lf, binning, unique_times, count=True),
+        'bin_ff': lambda lf: bin_ob(lf, binning, unique_times, ff=True),
+        'bin_count_ff': lambda lf: bin_ob(lf, binning, unique_times, count=True, ff=True),
+        'bin_ff_count': lambda lf: bin_ob(lf, binning, unique_times, count=True, ff=True),
         
         # Sink bins (must be done outside batching when using forward fill)
         'sink_bins': lambda lf: (sink_bins(lf), True),
@@ -119,35 +109,19 @@ def strip_ob(lf: pl.LazyFrame) -> pl.LazyFrame:
 # Binning functions
 # ===============================================================
 
-def bin_ob(lf: pl.LazyFrame, freq: str, count: bool = False, ff: bool = False) -> pl.LazyFrame:
-    """
-    Bin orderbook timestamps and keep most recent entry per time bin per symbol.
-    
-    Args:
-        freq: Polars duration string (e.g., '5m', '1m', '30s', '100ms')
-        count: Add 'bin_count' column with number of entries in each bin
-        ff: Forward fill to create complete (symbol, time_bin) grid
-    
-    Returns:
-        LazyFrame with 'time_bin' column added (and 'bin_count' if count=True)
-    """
-    # Bin the data
+def _bin(lf: pl.LazyFrame, time_bins: pl.Series, interval: int, count: bool = False, ff: bool = False) -> pl.LazyFrame:
+    time_bins_lf = time_bins.to_frame('time_bin').lazy()
+    lf = lf.sort('timeMs')
     agg_exprs = [pl.col('*').last(), pl.len().alias('bin_count')] if count else [pl.all().last()]
-    
     binned = (
         lf
-        .with_columns(pl.col('timeMs').cast(pl.Datetime('ms')).alias('_ts'))
-        .sort(['symbol', '_ts'])
-        .group_by_dynamic('_ts', every=freq, group_by='symbol', closed='right', label='right')
-        .agg(agg_exprs)
-        .with_columns(pl.col('_ts').dt.timestamp('ms').alias('time_bin'))
-        .drop('_ts')
+        .join_asof(time_bins_lf, left_on='timeMs', right_on='time_bin', strategy='forward')
+        .group_by(['symbol', 'time_bin'])
+        .agg(agg_exprs).sort(['symbol', 'time_bin'])
     )
-    
-    # Forward fill if requested
+    # Step 2: Forward fill if requested (create per-symbol grids based on actual trading ranges)
     if ff:
-        # Create per-symbol grids based on each symbol's actual trading range
-        # This avoids creating bins before a symbol started trading
+        # Get per-symbol time ranges
         symbol_ranges = (
             binned
             .group_by('symbol')
@@ -156,262 +130,99 @@ def bin_ob(lf: pl.LazyFrame, freq: str, count: bool = False, ff: bool = False) -
                 pl.col('time_bin').max().alias('max_time'),
             ])
         )
-        
-        # Get all unique time bins
-        all_time_bins = binned.select('time_bin').unique().sort('time_bin')
-        
-        # For each symbol, create grid only within its trading range
+        # For each symbol, create grid only within its trading range (plus one interval)
         complete_grid = (
             symbol_ranges
-            .join(all_time_bins, how='cross')
+            .join(time_bins_lf, how='cross')
             .filter(
                 (pl.col('time_bin') >= pl.col('min_time')) & 
-                (pl.col('time_bin') <= pl.col('max_time'))
+                (pl.col('time_bin') <= pl.col('max_time') + interval)
             )
             .select(['symbol', 'time_bin'])
+            .sort(['symbol', 'time_bin'])
         )
-        
         # Join and forward fill
+        exclude_cols = ['symbol', 'time_bin']
+        if count:
+            exclude_cols.append('bin_count')
+        
         binned = (
             complete_grid
-            .sort(['symbol', 'time_bin'])
-            .join(binned, on=['symbol', 'time_bin'], how='left')
-            .with_columns(
-                pl.all().exclude(['symbol', 'time_bin'] + (['bin_count'] if count else [])).forward_fill().over('symbol')
-            )
+            .join(binned, on=['symbol', 'time_bin'], how='left', maintain_order='left')
+            .with_columns(pl.all().exclude(exclude_cols).forward_fill().over('symbol'))
         )
-        
         # Fill missing bin_count with 0 if count=True
         if count:
             binned = binned.with_columns(pl.col('bin_count').fill_null(0))
     
     return binned
 
-def generate_time_bins(start_ms: int, end_ms: int, freq: str, include_next: bool = False) -> pl.Series:
-    """
-    Generate time bins from start to end at given frequency.
-    
-    Args:
-        start_ms: Start timestamp (ms)
-        end_ms: End timestamp (ms)
-        freq: Polars duration string (e.g., '5m', '1m', '30s')
-        include_next: If True, include one additional bin after end_ms
-    
-    Returns:
-        Series of Int64 timestamps (ms)
-    """
-    # Create datetime range
-    start_dt = pl.from_epoch(start_ms, time_unit='ms')
-    end_dt = pl.from_epoch(end_ms, time_unit='ms')
-    
-    # Generate bins using date_range
-    bins = pl.datetime_range(
-        start_dt,
-        end_dt,
-        interval=freq,
-        closed='right',
-        eager=True
-    )
-    
-    # Add one more bin if requested
-    if include_next:
-        next_bin = bins[-1] + pl.duration(microseconds=pl.duration(freq).dt.total_microseconds()[0])
-        bins = pl.concat([bins, pl.Series([next_bin])])
-    
-    # Convert to milliseconds
-    return bins.dt.timestamp('ms')
-
-def bin_ob_v2(lf: pl.LazyFrame, freq: str, count: bool = False, ff: bool = False) -> pl.LazyFrame:
-    """
-    Bin orderbook timestamps using join_asof (v2 implementation).
-    
-    This version is more efficient than bin_ob() as it avoids datetime casting.
-    Time bins are inferred from the data range automatically.
-    
-    Args:
-        freq: Polars duration string (e.g., '5m', '1m', '30s')
-        count: Add 'bin_count' column with number of entries in each bin
-        ff: Forward fill to create complete (symbol, time_bin) grid
-    
-    Returns:
-        LazyFrame with 'time_bin' column added (and 'bin_count' if count=True)
-    """
-    # Get time range from data and generate bins
+def _make_bins(lf: pl.LazyFrame, freq: str, ff: bool = False) -> tuple[pl.Series, int]:
     time_range = lf.select([
-        pl.col('timeMs').min().alias('min_time'),
-        pl.col('timeMs').max().alias('max_time')
+        pl.col('timeMs').min().cast(pl.Datetime('ms')).alias('min_time'),
+        pl.col('timeMs').max().cast(pl.Datetime('ms')).alias('max_time')
     ]).collect()
-    start_ms = time_range['min_time'][0]
-    end_ms = time_range['max_time'][0]
+    start_dt = time_range['min_time'][0]
+    end_dt = time_range['max_time'][0]
+    # Snap to midnight boundaries: start of first day, start of day after last
+    start_dt = datetime.combine(start_dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = datetime.combine(end_dt.date(), datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
     
-    # For forward fill, extend to first bin of next day to handle batch edges
-    include_next = ff
-    time_bins = generate_time_bins(start_ms, end_ms, freq, include_next=include_next)
-    time_bins_lf = pl.DataFrame({'time_bin': time_bins}).lazy()
-    
-    # Sort input data
-    lf = lf.sort(['symbol', 'timeMs'])
-    
+    # Generate bins as datetimes then convert to integer milliseconds
+    bins = pl.datetime_range(start_dt, end_dt, interval=freq, closed='right', time_unit='ms', eager=True)
+    interval = bins[1] - bins[0]
     if ff:
-        # Create complete grid: all symbols × all time bins
-        symbols = lf.select('symbol').unique()
-        complete_grid = (
-            symbols
-            .join(time_bins_lf, how='cross')
-            .sort(['symbol', 'time_bin'])
-        )
-        
-        # Join data to grid using asof, then forward fill within each symbol
-        binned = (
-            complete_grid
-            .join_asof(
-                lf.with_columns(pl.col('timeMs').alias('time_bin')),
-                on='time_bin',
-                by='symbol',
-                strategy='backward'
-            )
-            .with_columns(
-                pl.all().exclude(['symbol', 'time_bin']).forward_fill().over('symbol')
-            )
-        )
-    else:
-        # Create symbol × time_bin grid for join
-        symbols = lf.select('symbol').unique()
-        grid = symbols.join(time_bins_lf, how='cross').sort(['symbol', 'time_bin'])
-        
-        # Join using asof to get last value before each bin
-        binned = (
-            grid
-            .join_asof(
-                lf.with_columns(pl.col('timeMs').alias('time_bin')),
-                on='time_bin',
-                by='symbol',
-                strategy='backward'
-            )
-        )
+        # Explicitly specify dtype to match bins when concatenating
+        next_bin = pl.Series([bins[-1] + interval], dtype=bins.dtype)
+        bins = pl.concat([bins, next_bin])
     
-    # Add bin_count if requested
-    if count:
-        # Count how many original rows fall into each bin
-        bin_counts = (
-            lf
-            .join_asof(
-                time_bins_lf,
-                left_on='timeMs',
-                right_on='time_bin',
-                strategy='backward'
-            )
-            .group_by(['symbol', 'time_bin'])
-            .agg(pl.len().alias('bin_count'))
-        )
-        binned = binned.join(bin_counts, on=['symbol', 'time_bin'], how='left')
-        binned = binned.with_columns(pl.col('bin_count').fill_null(0))
-    
-    return binned
+    # Convert to integer milliseconds and get interval as int
+    bins = bins.dt.timestamp('ms')
+    interval = int(interval.total_seconds() * 1000)
+    return bins, interval
 
-def bin_by_times(lf: pl.LazyFrame, unique_times: list[int], ff: bool = False, count: bool = False) -> pl.LazyFrame:
-    """
-    Bin orderbook to specific timestamps.
-    
-    Automatically filters unique_times to the data range. For forward fill, extends
-    to the first timestamp after EOD of the last day in the data.
-    
-    Args:
-        unique_times: List of Int64 timestamps (ms) to bin to
-        ff: Forward fill to create complete grid
-        count: Add 'bin_count' column
-    
-    Returns:
-        LazyFrame with 'time_bin' column
-    """
+def _filter_times(lf: pl.LazyFrame, unique_times: list[int], ff: bool = False) -> pl.Series:
     # Get time range from data
     time_range = lf.select([
         pl.col('timeMs').min().alias('min_time'),
-        pl.col('timeMs').max().alias('max_time')
+        pl.col('timeMs').max().cast(pl.Datetime('ms')).alias('max_time')
     ]).collect()
     start_ms = time_range['min_time'][0]
-    end_ms = time_range['max_time'][0]
+    end_dt = time_range['max_time'][0]
+    # Get start of next day (EOD boundary)
+    eod_dt = datetime.combine(end_dt.date(), datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
+    eod_ms = int(eod_dt.timestamp() * 1000)
     
     # Filter unique_times to data range
-    filtered_times = [t for t in unique_times if t >= start_ms and t <= end_ms]
+    filtered_times = [t for t in unique_times if t >= start_ms and t <= eod_ms]
     
     # For forward fill, add first timestamp after EOD of last day
     if ff and filtered_times:
-        # Get EOD of max day (23:59:59.999)
-        from datetime import datetime, timezone
-        max_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
-        eod_ms = int(datetime(max_dt.year, max_dt.month, max_dt.day, 23, 59, 59, 999000, 
-                              tzinfo=timezone.utc).timestamp() * 1000)
-        
         # Find first time after EOD
         next_times = [t for t in unique_times if t > eod_ms]
         if next_times:
             filtered_times.append(min(next_times))
     
-    if not filtered_times:
-        return lf.with_columns(pl.lit(None, dtype=pl.Int64).alias('time_bin'))
+    # Always return a Series (empty if no times found)
+    time_bins = pl.Series('time_bin', sorted(filtered_times) if filtered_times else [], dtype=pl.Int64)
+    return time_bins
+
+def bin_ob(lf: pl.LazyFrame, binning: Optional[str] = None, unique_times: Optional[list[int]] = None, count: bool = False, ff: bool = False) -> tuple[pl.LazyFrame, bool]:
+    if binning is not None and unique_times is not None:
+        raise ValueError("Provide either 'binning' or 'unique_times', not both")
+    if binning is None and unique_times is None:
+        return (lf, False)
+    if binning is not None:
+        bins, interval = _make_bins(lf, binning, ff)
+    elif unique_times is not None:
+        bins = _filter_times(lf, unique_times, ff)
+        interval = 60 * 1000 # 1 minute by default
     
-    time_bins = pl.Series('time_bin', sorted(filtered_times), dtype=pl.Int64)
-    time_bins_lf = pl.DataFrame({'time_bin': time_bins}).lazy()
+    # Handle empty bins case
+    if len(bins) == 0:
+        return (lf, False)
     
-    # Sort input data
-    lf = lf.sort(['symbol', 'timeMs'])
-    
-    if ff:
-        # Create complete grid: all symbols × all time bins
-        symbols = lf.select('symbol').unique()
-        complete_grid = (
-            symbols
-            .join(time_bins_lf, how='cross')
-            .sort(['symbol', 'time_bin'])
-        )
-        
-        # Join data to grid using asof, then forward fill within each symbol
-        binned = (
-            complete_grid
-            .join_asof(
-                lf.with_columns(pl.col('timeMs').alias('time_bin')),
-                on='time_bin',
-                by='symbol',
-                strategy='backward'
-            )
-            .with_columns(
-                pl.all().exclude(['symbol', 'time_bin']).forward_fill().over('symbol')
-            )
-        )
-    else:
-        # Create symbol × time_bin grid for join
-        symbols = lf.select('symbol').unique()
-        grid = symbols.join(time_bins_lf, how='cross').sort(['symbol', 'time_bin'])
-        
-        # Join using asof to get last value before each bin
-        binned = (
-            grid
-            .join_asof(
-                lf.with_columns(pl.col('timeMs').alias('time_bin')),
-                on='time_bin',
-                by='symbol',
-                strategy='backward'
-            )
-        )
-    
-    # Add bin_count if requested
-    if count:
-        bin_counts = (
-            lf
-            .join_asof(
-                time_bins_lf,
-                left_on='timeMs',
-                right_on='time_bin',
-                strategy='backward'
-            )
-            .group_by(['symbol', 'time_bin'])
-            .agg(pl.len().alias('bin_count'))
-        )
-        binned = binned.join(bin_counts, on=['symbol', 'time_bin'], how='left')
-        binned = binned.with_columns(pl.col('bin_count').fill_null(0))
-    
-    return binned
+    return (_bin(lf, bins, interval, count, ff), True)
 
 def sink_bins(lf: pl.LazyFrame) -> pl.LazyFrame:
     """Sink time_bin into timeMs by dropping old timeMs and renaming time_bin."""

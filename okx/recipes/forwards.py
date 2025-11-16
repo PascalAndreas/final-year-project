@@ -424,7 +424,7 @@ def assign_forwards(
     curve_type = _get_recipe_type(forwards_recipe)
     if verbose:
         start_time = datetime.now()
-        print(f"Assigning {curve_type} forwards to {len(dates)} dates")
+        print(f"Assigning {curve_type} forwards to {len(dates)} dates using {curve_type} forwards")
     # Collect the input data (needed for array operations)
     df_data = lf_data.collect()
     if df_data.is_empty():

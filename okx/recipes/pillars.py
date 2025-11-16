@@ -150,18 +150,13 @@ def prepare_pillars(
     pillars = (
         pillars
         .sort(['timeMs', 'T'])
-        .with_columns([
-            pl.int_range(pl.len()).over('timeMs').alias('pillar_idx'),
-            pl.len().over('timeMs').alias('_pillars_per_time'),
-        ])
+        .with_columns(
+            pl.int_range(pl.len()).over('timeMs').alias('pillar_idx')
+        )
     )
 
     if drop_pillar_idx is not None:
-        pillars = pillars.filter(
-            pl.col('_pillars_per_time') > drop_pillar_idx
-        ).filter(pl.col('pillar_idx') != drop_pillar_idx)
-    
-    pillars = pillars.drop('_pillars_per_time')
+        pillars = pillars.filter(pl.col('pillar_idx') != drop_pillar_idx)
     
     if verbose:
         end_time = datetime.now()

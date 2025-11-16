@@ -279,7 +279,8 @@ class OrderbookStore:
                           depth: Optional[int], binning: Optional[str], 
                           unique_times: Optional[list[int]], 
                           features: list = [], 
-                          verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
+                          verbose: bool = False, benchmark: bool = False,
+                          benchmark_fn: Optional[Callable[[pl.DataFrame], None]] = None) -> pl.LazyFrame:
         """
         Apply transformations in order specified by features list.
         
@@ -294,10 +295,13 @@ class OrderbookStore:
             if not benchmark:
                 return lf
             t0 = time.perf_counter()
-            lf = lf.collect().lazy()
+            df = lf.collect()
             elapsed = time.perf_counter() - t0
             print(f"  [benchmark] {feat_name}: {elapsed:.3f}s")
-            return lf
+            # Call user-provided benchmark function if provided
+            if benchmark_fn is not None:
+                benchmark_fn(df)
+            return df.lazy()
 
         # Helper to flush accumulated feature names with optional benchmarking
         def _flush(lf: pl.LazyFrame, feat_names: list) -> tuple[pl.LazyFrame, list]:
@@ -374,7 +378,8 @@ class OrderbookStore:
             unique_times: Optional[list[int]] = None,
             features: list = [], cache_name: Optional[str] = None,
             batch_days: Optional[int] = None,
-            verbose: bool = False, benchmark: bool = False) -> pl.LazyFrame:
+            verbose: bool = False, benchmark: bool = False,
+            benchmark_fn: Optional[Callable[[pl.DataFrame], None]] = None) -> pl.LazyFrame:
         """
         Get orderbook data with transformations.
         Provide either (start, end) datetimes or a list of dates. If cache_name provided, result is cached.
@@ -392,31 +397,43 @@ class OrderbookStore:
         apply_sink_bins_after = 'sink_bins_after' in features
         if apply_sink_bins_after:
             features = [f for f in features if f != 'sink_bins_after']
+        print(f"Applying sink bins after: {apply_sink_bins_after}")
         
         # Build batches
         builder = lambda dates_to_build: self._apply_transforms(
             self._scan_raw(inst_family, inst_type, dates_to_build),
             inst_family, inst_type,
             depth, binning, unique_times, features,
-            verbose=verbose, benchmark=benchmark
+            verbose=verbose, benchmark=benchmark, benchmark_fn=benchmark_fn
         )
         result = self._get(inst_family, inst_type, dates, builder, cache_name, batch_days, 
                           verbose, benchmark)
         
         # Deduplicate if using forward fill with batching (to handle overlapping bins at batch edges)
         using_ff = any('ff' in str(f) for f in features)
+        print(f"Using forward fill: {using_ff}")
         batching = batch_days is not None and len(dates) > batch_days
-        if using_ff and batching and apply_sink_bins_after:
+        print(f"Batching: {batching}")
+        if using_ff and batching:
             t0 = time.perf_counter()
-            result = result.unique(subset=['symbol', 'time_bin'], keep='last', maintain_order=True)
+            print(f"  Rows before deduplication: {result.select(pl.len()).collect().item()}")
+            cols = result.collect_schema().names()
+            if 'time_bin' in cols:
+                result = result.unique(subset=['symbol', 'time_bin'], keep='last', maintain_order=True).collect().lazy()
+                print(f"  Deduplicated by time_bin")
+            else:
+                result = result.unique(subset=['symbol', 'timeMs'], keep='last', maintain_order=True).collect().lazy()
+                print(f"  Deduplicated by timeMs")
             print(f"  [benchmark] Deduplication: {time.perf_counter() - t0:.3f}s")
-        
+            print(f"  Rows after deduplication: {result.select(pl.len()).collect().item()}")
         # Apply sink_bins after batching if requested
         if apply_sink_bins_after:
             t0 = time.perf_counter()
             result = sink_bins(result)
             print(f"  [benchmark] Sink bins: {time.perf_counter() - t0:.3f}s")
-        
+        if benchmark_fn is not None:
+            benchmark_fn(result.collect())
+
         return result
     
     def get_derived(self, recipe: Callable[[object, list[date]], pl.LazyFrame],

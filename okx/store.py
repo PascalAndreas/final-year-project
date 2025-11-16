@@ -326,8 +326,6 @@ class OrderbookStore:
                 lf, feature_names = _flush(lf, feature_names)
                 lf, was_applied = FLUSH_FEATURES[feat](lf)
                 if was_applied:
-                    if verbose:
-                        print(f"  - applied '{feat}'")
                     lf = _benchmark_transform(lf, feat)
                 # Track trim/bin application for default fallback
                 if feat == 'trim':
@@ -337,15 +335,11 @@ class OrderbookStore:
             elif feat in FEATURES:
                 # Registry feature - accumulate for parallel execution
                 feature_names.append(feat)
-                if verbose:
-                    print(f"  - applied '{feat}'")
             elif callable(feat):
                 lf, feature_names = _flush(lf, feature_names)
                 lf = feat(lf)
                 feat_name = _get_function_name(feat)
                 lf = _benchmark_transform(lf, feat_name)
-                if verbose:
-                    print(f"  - applied '{feat_name}'")
             else:
                 if isinstance(feat, str):
                     available = [*FEATURES.keys(), *FLUSH_FEATURES.keys()]
@@ -359,14 +353,10 @@ class OrderbookStore:
         if not trim_applied and depth is not None:
             lf, trim_applied = FLUSH_FEATURES['trim'](lf)
             if trim_applied:
-                if verbose:
-                    print(f"  - applied default 'trim'")
                 lf = _benchmark_transform(lf, 'trim (default)')
         if not bin_applied and binning is not None:
             lf, bin_applied = FLUSH_FEATURES['bin'](lf)
             if bin_applied:
-                if verbose:
-                    print(f"  - applied default 'bin'")
                 lf = _benchmark_transform(lf, 'bin (default)')
         
         return lf

@@ -64,6 +64,8 @@ def prepare_options(
     verbose: bool = True,
 ) -> pl.LazyFrame:
     """
+    NOTE: Pairing options is broken when binning is not used.
+
     Prepare options data with metadata and fitted forward prices.
     
     This function:
@@ -135,6 +137,8 @@ def prepare_options(
     # Optionally pair calls and puts early (before numeraire conversion)
     if paired:
         lf_options = _pair_options(lf_options)
+        if not binning:
+            print("(!!!) WARNING: Pairing options is broken when binning is not used. Most rows will be dropped.")
 
     if verbose:
         time_1 = datetime.now()

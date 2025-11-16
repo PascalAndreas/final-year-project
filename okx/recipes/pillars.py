@@ -13,17 +13,17 @@ def prepare_pillars(
     batch_days: Optional[int] = None,
     anchor: str = 'SWAP',  # Must be 'SWAP' or 'SPOT'
     verbose: bool = False,
+    log_prices: bool = True,
 ) -> pl.LazyFrame:
     """
     Prepare concatenated pillar data from SWAP/SPOT and FUTURES orderbooks.
 
     Returns a LazyFrame sorted by (timeMs, T) that contains the latest snapshot
-    for each instrument at or before every requested timestamp. This keeps the
-    function compatible with store.get_derived() caching and avoids Python-side
-    looping over symbols/timestamps.
+    for each instrument at or before every requested timestamp.
 
     This function is mature, but there stands two potential improvements:
      - unique_times binning and ff could be pushed upstream to the store.get call, but this would require clever implementation for compatability with batching.
+         - NOTE: Binning has been reworked, so this is relatively trivial now, but I don't believe it would yield any performance benefits.
      - previous day's data could be fetched and processed to ensure early bin/timestamps have full coverage.
     """
     if not dates:
@@ -49,7 +49,13 @@ def prepare_pillars(
         features.extend(['bin_ff', 'sink_bins'])
     else:
         features.extend(['dedupe'])
-    features.extend(['rel_spread', 'tenor', 'log'])
+    features.extend(['rel_spread', 'tenor'])
+    if log_prices:
+        features.extend(['log'])
+
+    cache_name = f"{'full' if binning is None else binning}_pillars"
+    if log_prices:
+        cache_name += '_log'
 
     shared_params = {
         'inst_family': inst_family,
@@ -57,7 +63,7 @@ def prepare_pillars(
         'depth': 1,
         'features': features,
         'binning': binning,
-        'cache_name': f"{'full' if binning is None else binning}_pillars",
+        'cache_name': cache_name,
         'batch_days': batch_days,
         'verbose': False,
     }
@@ -127,7 +133,8 @@ def prepare_pillars(
     # =============================================================================
     
     # Ensure column ordering matches before concatenation
-    pillar_cols = ['symbol', 'timeMs', 'rel_spread', 'expiry', 'T', 'ln_bid_1_px', 'ln_ask_1_px']
+    price_cols = ['ln_bid_1_px', 'ln_ask_1_px'] if log_prices else ['bid_1_px', 'ask_1_px']
+    pillar_cols = ['symbol', 'timeMs', 'rel_spread', 'expiry', 'T', *price_cols]
     pillars = pl.concat([
         lf_anchor.select(pillar_cols),
         lf_futures.select(pillar_cols)
@@ -151,8 +158,11 @@ def prepare_pillars(
         pillars
         .sort(['timeMs', 'T'])
         .with_columns(
-            pl.int_range(pl.len()).over('timeMs').alias('pillar_idx')
+            pl.int_range(pl.len()).over('timeMs').alias('pillar_idx'),
+            pl.len().over('timeMs').alias('_pillars_per_time')
         )
+        .filter(pl.col('_pillars_per_time') >= 3) # Filter out times with less than 3 pillars to avoid issues with LOEO
+        .drop('_pillars_per_time')
     )
 
     if drop_pillar_idx is not None:

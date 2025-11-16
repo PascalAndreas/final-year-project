@@ -390,6 +390,7 @@ def assign_forwards(
     forwards_recipe: Callable,
     inst_family: str = 'BTC-USD',
     binning: Optional[str] = None,
+    batch_days: Optional[int] = None,
     verbose: bool = True,
 ) -> pl.LazyFrame:
     """
@@ -446,9 +447,9 @@ def assign_forwards(
     # Configure forwards recipe with appropriate parameters
     if binning is None:
         unique_times = df_data['timeMs'].unique().sort().to_list()
-        forwards_recipe = partial(forwards_recipe, unique_times=unique_times, verbose=verbose)
+        forwards_recipe = partial(forwards_recipe, unique_times=unique_times, batch_days=batch_days, verbose=verbose)
     else: 
-        forwards_recipe = partial(forwards_recipe, binning=binning, verbose=verbose)
+        forwards_recipe = partial(forwards_recipe, binning=binning, batch_days=batch_days, verbose=verbose)
 
     # Fetch forward dataset
     df_forwards = store.get_derived(

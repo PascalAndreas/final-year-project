@@ -245,29 +245,8 @@ def drop_nulls(lf: pl.LazyFrame) -> pl.LazyFrame:
 # ===============================================================
 # Symbol parsing features
 # ===============================================================
-# TODO: Benchmark the two parse_option functions and use the faster one.
 
 def parse_option(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Parse option symbols to add 'strike' and 'opt_type' columns."""
-    # Symbol format: BTC-USD-250627-200000-C (currency-date-strike-type)
-    # Remove file extension if present (e.g., '.OK') and split by '-'
-    # Using vectorized string operations - much faster than map_elements
-    return lf.with_columns([
-        # Extract strike (4th element after split, index 3)
-        pl.col('symbol')
-          .str.split('.').list.first() # Remove extension
-          .str.split('-').list.get(3)
-          .cast(pl.Int64)
-          .alias('strike'),
-        # Extract option type (5th element after split, index 4)
-        pl.col('symbol')
-          .str.split('.').list.first() # Remove extension
-          .str.split('-').list.get(4)
-          .str.to_uppercase()
-          .alias('opt_type'),
-    ])
-
-def parse_option_v2(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf.with_columns(
         pl.col('symbol')
             .str.split('.').list.first() # Remove extension

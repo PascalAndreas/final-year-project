@@ -241,6 +241,70 @@ def summarize_pillar_fit(lf_errors: pl.LazyFrame) -> pl.LazyFrame:
     ])
 
 # =============================================================================
+# Run full evaluation suite
+# =============================================================================
+
+def run_full_evaluation(
+    store,
+    dates: list[date],
+    inst_family: str,
+    recipes: dict[str, callable],
+    binning: Optional[str],
+    batch_days: Optional[int] = None,
+    verbose: bool = True,
+) -> dict:
+    """Run full evaluation suite for all recipes."""
+    results = {}
+
+    for recipe_name, recipe_fn in recipes.items():
+        print(f"\n{'='*60}")
+        print(f"Evaluating {recipe_name.upper()} on {len(dates)} dates with {binning} binning")
+        print(f"{'='*60}\n")
+        
+        results[recipe_name] = {}
+        recipe_fn = partial(recipe_fn, inst_family=inst_family, batch_days=batch_days, verbose=True)
+
+        # Put-call parity
+        print(f"\n--- Put-Call Parity ---")
+        lf_parity = evaluate_parity(
+            store=store,
+            dates=dates,
+            inst_family=inst_family,
+            forwards_recipe=recipe_fn,
+            binning=binning,
+            batch_days=batch_days,
+            verbose=verbose,
+        )
+        results[recipe_name]['parity'] = lf_parity
+        
+        # Pillar fit
+        print(f"\n--- Pillar Fit Quality ---")
+        lf_pillar_fit = evaluate_pillar_fit(
+            store=store,
+            dates=dates,
+            inst_family=inst_family,
+            forwards_recipe=recipe_fn,
+            binning=binning,
+            verbose=verbose,
+        )
+        results[recipe_name]['pillar_fit'] = lf_pillar_fit
+        
+        # LOEO
+        print(f"\n--- Leave-One-Expiry-Out ---")
+        lf_loeo = evaluate_loeo(
+            store=store,
+            dates=dates,  # First 3 days only
+            inst_family=inst_family,
+            forwards_recipe=recipe_fn,
+            binning=binning,
+            verbose=verbose,
+        )
+        results[recipe_name]['loeo'] = lf_loeo
+
+    return results
+
+
+# =============================================================================
 # Old Evaluation Functions - Might be worth implementing properly in the future
 # =============================================================================
 

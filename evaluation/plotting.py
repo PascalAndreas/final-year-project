@@ -89,6 +89,7 @@ def plot_error_over_time(
     resample_freq: str = '1h',
     show_spread: bool = True,
     spread_quantiles: tuple[float, float] = (0.25, 0.75),
+    include_zero: bool = True,
     **kwargs
 ) -> plt.Axes:
     """
@@ -102,6 +103,7 @@ def plot_error_over_time(
         resample_freq: Frequency to resample data (e.g., '1h', '30m', '1d')
         show_spread: Whether to show spread as shaded region
         spread_quantiles: Quantiles to use for spread (default: 25th-75th percentile)
+        include_zero: Whether to include zero in y-axis (default: True)
         **kwargs: Additional kwargs passed to ax.plot
         
     Returns:
@@ -168,8 +170,9 @@ def plot_error_over_time(
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     
-    # Add horizontal line at zero
-    ax.axhline(0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
+    # Add horizontal line at zero if requested
+    if include_zero:
+        ax.axhline(0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
     
     return ax
 
@@ -290,7 +293,7 @@ def plot_error_by_group(
     ax: Optional[plt.Axes] = None,
     resample_freq: str = '1h',
     n_bins: Optional[int] = None,
-    show_spread: bool = False,
+    show_spread: bool = True,
     spread_quantiles: tuple[float, float] = (0.25, 0.75),
     **kwargs
 ) -> plt.Axes:

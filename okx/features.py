@@ -63,6 +63,7 @@ def build_flush_features(
         'parse_option': lambda lf: (parse_option(lf), True),
         'nullify': lambda lf: (nullify(lf), True),
         'drop_nulls': lambda lf: (drop_nulls(lf), True),
+        'drop_nulls_strict': lambda lf: (drop_nulls_strict(lf), True),
         'dedupe': lambda lf: (lf.unique(maintain_order=True), True),
     }
 
@@ -291,22 +292,22 @@ def nullify(lf: pl.LazyFrame) -> pl.LazyFrame:
     ])
 
 def drop_nulls(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """
-    Filter out rows where both bid and ask are null.
-    
-    Useful after bin_ff which can create null rows when forward-filling
-    before a symbol's first datapoint or during data gaps.
-    """
-    # Check for log-space columns first (ln_bid_1_px/ln_ask_1_px)
+    """Filter out rows where either bid or ask is null."""
     cols = lf.collect_schema().names()
-    if 'ln_bid_1_px' in cols and 'ln_ask_1_px' in cols:
-        return lf.filter(
-            pl.col('ln_bid_1_px').is_not_null() | pl.col('ln_ask_1_px').is_not_null()
-        )
-    elif 'bid_1_px' in cols and 'ask_1_px' in cols:
-        return lf.filter(
-            pl.col('bid_1_px').is_not_null() | pl.col('ask_1_px').is_not_null()
-        )
+    if 'bid_1_px' in cols and 'ask_1_px' in cols:
+        return lf.filter(pl.col('bid_1_px').is_not_null() | pl.col('ask_1_px').is_not_null())
+    elif 'ln_bid_1_px' in cols and 'ln_ask_1_px' in cols:
+        return lf.filter(pl.col('ln_bid_1_px').is_not_null() | pl.col('ln_ask_1_px').is_not_null())
+    else:
+        return lf
+
+def drop_nulls_strict(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Filter out rows where both bid and ask are null."""
+    cols = lf.collect_schema().names()
+    if 'bid_1_px' in cols and 'ask_1_px' in cols:
+        return lf.filter(pl.col('bid_1_px').is_not_null() & pl.col('ask_1_px').is_not_null())
+    elif 'ln_bid_1_px' in cols and 'ln_ask_1_px' in cols:
+        return lf.filter(pl.col('ln_bid_1_px').is_not_null() & pl.col('ln_ask_1_px').is_not_null())
     else:
         return lf
 

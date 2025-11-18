@@ -28,8 +28,6 @@ from .plotting import (
     plot_kalman_snapshot,
     plot_ns_factors,
     plot_forward_tracking,
-    plot_error_distribution,
-    plot_spread_analysis,
     create_comparison_figure,
 )
 
@@ -53,7 +51,5 @@ __all__ = [
     "plot_kalman_snapshot",
     "plot_ns_factors",
     "plot_forward_tracking",
-    "plot_error_distribution",
-    "plot_spread_analysis",
     "create_comparison_figure",
 ]

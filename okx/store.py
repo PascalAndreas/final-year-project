@@ -227,16 +227,20 @@ class OrderbookStore:
         with sqlite3.connect(self.manifest.path) as conn:
             rows = conn.execute("SELECT inst_family, inst_type, date, path FROM files WHERE variant=?", 
                               (variant,)).fetchall()
-        
+
         results = []
-        for i, (inst_family, inst_type, date_str, path_str) in enumerate(rows):
+        iterator = enumerate(rows)
+        if verbose:
+            from tqdm import tqdm
+            iterator = tqdm(enumerate(rows), total=len(rows), desc="Inspecting files", leave=True, dynamic_ncols=True)
+        for i, (inst_family, inst_type, date_str, path_str) in iterator:
             if verbose:
-                print(f"[{i+1}/{len(rows)}] Inspecting {inst_family}/{inst_type}/{date_str}")
+                iterator.set_description(f"Inspecting {inst_family}/{inst_type}/{date_str} [{i+1}/{len(rows)}]")
             path = pathlib.Path(path_str)
             lf = pl.scan_parquet(path)
             result = fn(lf, inst_family, inst_type, date_str)
             results.append(result)
-        
+
         return results
     
     # =============================================================================

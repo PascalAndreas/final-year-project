@@ -74,7 +74,7 @@ def plot_error_histogram(
     
     ax.set_xlabel('Error (bps)', fontsize=11)
     ax.set_ylabel('Count', fontsize=11)
-    ax.set_title(f'{method_name} - Error Distribution', fontsize=13, fontweight='bold')
+    ax.set_title(f'{method_name.title()} - Error Distribution')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3, axis='y')
     
@@ -164,7 +164,7 @@ def plot_error_over_time(
     
     ax.set_xlabel('Time', fontsize=11)
     ax.set_ylabel('Error (bps)', fontsize=11)
-    ax.set_title(f'{method_name} - Error Over Time', fontsize=13, fontweight='bold')
+    ax.set_title(f'{method_name.title()} - Error Over Time')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     
@@ -388,8 +388,7 @@ def plot_error_by_group(
     
     ax.set_xlabel('Time', fontsize=11)
     ax.set_ylabel(f'{error_col} (bps)', fontsize=11)
-    ax.set_title(f'{method_name} - {error_col} by {group_col_to_use}', 
-                fontsize=13, fontweight='bold')
+    ax.set_title(f'{method_name.title()} - {error_col} by {group_col_to_use}')
     ax.legend(fontsize=9, ncol=min(3, len(groups)))
     ax.grid(True, alpha=0.3)
     

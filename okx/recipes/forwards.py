@@ -32,33 +32,24 @@ from tqdm import tqdm
 # =============================================================================
 
 def _find_contiguous_groups(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Find contiguous blocks of identical values in a sorted array.
-    
-    Returns:
-        (start_indices, end_indices): Arrays of start/end indices for each group.
-    """
-    if len(values) == 0:
-        return np.array([], dtype=int), np.array([], dtype=int)
-    
-    change_points = np.flatnonzero(np.diff(values)) + 1 if len(values) > 1 else np.array([], dtype=int)
+    """Find contiguous blocks of identical values in a sorted array."""
+    change_points = np.flatnonzero(np.diff(values)) + 1
     start_indices = np.concatenate(([0], change_points))
     end_indices = np.concatenate((change_points, [len(values)]))
-    return start_indices, end_indices
+    times = values[start_indices]
+    return times, start_indices, end_indices
 
-
-def _extract_pillar_arrays(pillars_df: pl.DataFrame) -> dict:
-    """Extract arrays from concatenated pillars DataFrame (already sorted by T)."""
-    return {
-        'timeMs': int(pillars_df['timeMs'][0]),
-        'T': pillars_df['T'].to_numpy(),
-        'ln_F_bid': pillars_df['ln_bid_1_px'].to_numpy(),
-        'ln_F_ask': pillars_df['ln_ask_1_px'].to_numpy(),
-        'rel_spreads': pillars_df['rel_spread'].to_numpy(),
-        'symbols': pillars_df['symbol'].to_list(),
-    }
-
-
+def _extract_pillar_groups(pillars_df: pl.DataFrame):
+    """Extract pillar arrays and identify contiguous time groups in a sorted DataFrame."""
+    # Extract arrays once
+    time_values = pillars_df['timeMs'].to_numpy()
+    T_values = pillars_df['T'].to_numpy()
+    bid_values = pillars_df['ln_bid_1_px'].to_numpy()
+    ask_values = pillars_df['ln_ask_1_px'].to_numpy()
+    
+    # Find contiguous blocks of identical timeMs
+    groups = zip(*_find_contiguous_groups(time_values))
+    return groups, T_values, bid_values, ask_values
 
 # =============================================================================
 # Forward curve building recipes
@@ -117,24 +108,18 @@ def build_forwards_pchip(
         time_1 = datetime.now()
         print(f" - Time taken to prepare pillars: {time_1 - start_time}")
 
-    # Convert once to NumPy arrays/lists to avoid per-group DataFrame materialization
-    time_values = df_pillars['timeMs'].to_numpy()
-    T_values = df_pillars['T'].to_numpy()
-    ln_bid_values = df_pillars['ln_bid_1_px'].to_numpy()
-    ln_ask_values = df_pillars['ln_ask_1_px'].to_numpy()
-    symbol_values = df_pillars['symbol'].to_list()
-
-    # Find contiguous blocks of identical timeMs without creating per-time DataFrames
-    start_indices, end_indices = _find_contiguous_groups(time_values)
+    # Extract arrays and get time group iterator
+    groups, T_values, bid_values, ask_values = _extract_pillar_groups(df_pillars)
+    symbols = df_pillars['symbol'].to_list()
 
     curves = []
-    for start_idx, end_idx in zip(start_indices, end_indices):
+    for timeMs, start_idx, end_idx in groups:
         curve = fit_pchip_curve(
             T_pillars=T_values[start_idx:end_idx],
-            F_bid_pillars=ln_bid_values[start_idx:end_idx],
-            F_ask_pillars=ln_ask_values[start_idx:end_idx],
-            symbols=symbol_values[start_idx:end_idx],
-            timeMs=int(time_values[start_idx]),
+            F_bid_pillars=bid_values[start_idx:end_idx],
+            F_ask_pillars=ask_values[start_idx:end_idx],
+            symbols=symbols[start_idx:end_idx],
+            timeMs=timeMs,
         )
         curves.append(curve)
     
@@ -213,19 +198,19 @@ def build_forwards_kalman(
         time_1 = datetime.now()
         print(f" - Time taken to prepare and collect pillars: {time_1 - start_time}")
 
-    snapshots = []
+    # Extract arrays and get time group iterator
+    groups, T_values, bid_values, ask_values = _extract_pillar_groups(df_pillars)
+    spreads = df_pillars['rel_spread'].to_numpy()
     
-    for pillars_df in df_pillars.partition_by('timeMs', maintain_order=True):
-        # Extract arrays from concatenated pillars
-        data = _extract_pillar_arrays(pillars_df)
-        
+    snapshots = []
+    for timeMs, start_idx, end_idx in groups:
         # Create snapshot dict for kalman_filter
         snapshot = {
-            'timeMs': data['timeMs'],
-            'T': data['T'],
-            'ln_F_bid': data['ln_F_bid'],
-            'ln_F_ask': data['ln_F_ask'],
-            'rel_spreads': data['rel_spreads'],
+            'timeMs': timeMs,
+            'T': T_values[start_idx:end_idx],
+            'ln_F_bid': bid_values[start_idx:end_idx],
+            'ln_F_ask': ask_values[start_idx:end_idx],
+            'rel_spreads': spreads[start_idx:end_idx],
         }
         snapshots.append(snapshot)
     
@@ -313,7 +298,7 @@ def _populate_forward_arrays(
     """
     Assign forward bids/asks to every timestamp in parallel.
     
-    Assumes df_data is already sorted by [timeMs, T] and non-empty.
+    Assumes df_data is already sorted by timeMs and non-empty.
     
     Steps:
         1. Identify contiguous time groups in sorted data.
@@ -326,7 +311,7 @@ def _populate_forward_arrays(
     n_rows = len(df_data)
     time_values = df_data['timeMs'].to_numpy()
     T_values = df_data['T'].to_numpy()
-    start_indices, end_indices = _find_contiguous_groups(time_values)
+    times, start_indices, end_indices = _find_contiguous_groups(time_values)
 
     F_bid_array = np.full(n_rows, np.nan, dtype=np.float64)
     F_ask_array = np.full(n_rows, np.nan, dtype=np.float64)
@@ -339,7 +324,7 @@ def _populate_forward_arrays(
             start_idx = start_indices[group_idx]
             end_idx = end_indices[group_idx]
 
-            timeMs = int(time_values[start_idx])
+            timeMs = times[group_idx]
             curve = curves_by_time.get(timeMs)
             if curve is None:
                 missing_curve += 1

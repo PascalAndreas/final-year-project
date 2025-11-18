@@ -199,7 +199,7 @@ def evaluate_loeo(
         'dates': dates,
         'inst_family': inst_family,
         'binning': binning,
-        'verbose': verbose,
+        'verbose': False, # Verbosity prints for each pillar are excessive, so we suppress them
         'batch_days': batch_days
     }
     # Prepare pillars
@@ -251,10 +251,19 @@ def run_full_evaluation(
     recipes: dict[str, callable],
     binning: Optional[str],
     batch_days: Optional[int] = None,
+    moneyness_spread: float = None,
     verbose: bool = True,
 ) -> dict:
     """Run full evaluation suite for all recipes."""
     results = {}
+    shared_params = dict(
+        store=store,
+        dates=dates,
+        inst_family=inst_family,
+        binning=binning,
+        batch_days=batch_days,
+        verbose=verbose,
+    )
 
     for recipe_name, recipe_fn in recipes.items():
         print(f"\n{'='*60}")
@@ -267,37 +276,25 @@ def run_full_evaluation(
         # Put-call parity
         print(f"\n--- Put-Call Parity ---")
         lf_parity = evaluate_parity(
-            store=store,
-            dates=dates,
-            inst_family=inst_family,
+            **shared_params,
             forwards_recipe=recipe_fn,
-            binning=binning,
-            batch_days=batch_days,
-            verbose=verbose,
+            **({"moneyness_spread": moneyness_spread} if moneyness_spread is not None else {})
         )
         results[recipe_name]['parity'] = lf_parity
         
         # Pillar fit
         print(f"\n--- Pillar Fit Quality ---")
         lf_pillar_fit = evaluate_pillar_fit(
-            store=store,
-            dates=dates,
-            inst_family=inst_family,
+            **shared_params,
             forwards_recipe=recipe_fn,
-            binning=binning,
-            verbose=verbose,
         )
         results[recipe_name]['pillar_fit'] = lf_pillar_fit
         
         # LOEO
         print(f"\n--- Leave-One-Expiry-Out ---")
         lf_loeo = evaluate_loeo(
-            store=store,
-            dates=dates,  # First 3 days only
-            inst_family=inst_family,
+            **shared_params,
             forwards_recipe=recipe_fn,
-            binning=binning,
-            verbose=verbose,
         )
         results[recipe_name]['loeo'] = lf_loeo
 

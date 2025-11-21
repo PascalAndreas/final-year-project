@@ -23,7 +23,7 @@ import polars as pl
 from datetime import date, datetime
 from typing import Callable, Optional
 
-from okx.recipes.helpers import early_roll
+from okx.recipes.helpers import early_roll, pair_options
 from okx.recipes.forwards import assign_forwards
 from okx.helpers import _get_function_name
 
@@ -36,22 +36,7 @@ CONTRACT_MULTIPLIERS = {
     'ETH-USD': 0.1,
 }
 
-def _pair_options(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Pair calls and puts with matching timeMs, expiry, and strike."""
-    lf_calls = lf.filter(pl.col('opt_type') == 'C').select([
-        'timeMs', 'expiry', 'strike', 'T',
-        'bid_1_px', 'ask_1_px'
-    ]).rename({
-        'bid_1_px': 'call_bid_1_px',
-        'ask_1_px': 'call_ask_1_px',
-    })
-    lf_puts = lf.filter(pl.col('opt_type') == 'P').select([
-        'timeMs', 'expiry', 'strike', 'bid_1_px', 'ask_1_px'
-    ]).rename({
-        'bid_1_px': 'put_bid_1_px',
-        'ask_1_px': 'put_ask_1_px',
-    })
-    return lf_calls.join(lf_puts, on=['timeMs', 'expiry', 'strike'], how='inner')
+
 
 def prepare_options(
     store,
@@ -136,7 +121,12 @@ def prepare_options(
 
     # Optionally pair calls and puts early (before numeraire conversion)
     if paired:
-        lf_options = _pair_options(lf_options)
+        lf_options = pair_options(lf_options).rename({
+            'call_bid': 'call_bid_1_px',
+            'call_ask': 'call_ask_1_px',
+            'put_bid': 'put_bid_1_px',
+            'put_ask': 'put_ask_1_px',
+        }) # Rename for compatability since I've updated the column names in the pair_options function. Will be removed in the future.
         if not binning:
             print("(!!!) WARNING: Pairing options is broken when binning is not used. Most rows will be dropped.")
 

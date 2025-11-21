@@ -222,11 +222,17 @@ class OrderbookStore:
             tmp.rename(path)
     
     def inspect(self, fn: Callable[[pl.LazyFrame, str, str, str], any], 
-                variant: str = 'raw', verbose: bool = True) -> list[any]:
-        """Run arbitrary function over all parquet files in manifest (read-only)."""
+        variant: str = 'raw', verbose: bool = True, sort: Optional[str] = None) -> list[any]:
+        """Run arbitrary function over all parquet files in manifest (read-only). Can sort by date or inst_type."""
         with sqlite3.connect(self.manifest.path) as conn:
             rows = conn.execute("SELECT inst_family, inst_type, date, path FROM files WHERE variant=?", 
                               (variant,)).fetchall()
+
+        # Optionally sort rows by key
+        if sort == 'date':
+            rows.sort(key=lambda x: x[2])  # x[2] = date_str
+        elif sort == 'inst_type':
+            rows.sort(key=lambda x: x[1])  # x[1] = inst_type
 
         results = []
         iterator = enumerate(rows)

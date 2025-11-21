@@ -18,6 +18,36 @@ def early_roll(min_time_to_expiry_hours: float):
         return lf.filter(time_to_expiry_seconds >= min_seconds)
     return filter_fn
 
+def pair_options(lf: pl.LazyFrame, include_qty: bool = False) -> pl.LazyFrame:
+    """Pair calls and puts with matching timeMs, expiry, and strike."""
+    # Build column lists based on whether quantities are included
+    call_cols = ['timeMs', 'expiry', 'strike', 'T', 'bid_1_px', 'ask_1_px']
+    put_cols = ['timeMs', 'expiry', 'strike', 'bid_1_px', 'ask_1_px']
+    call_rename = {
+        'bid_1_px': 'call_bid',
+        'ask_1_px': 'call_ask',
+    }
+    put_rename = {
+        'bid_1_px': 'put_bid',
+        'ask_1_px': 'put_ask',
+    }
+    
+    if include_qty:
+        call_cols.extend(['bid_1_qty', 'ask_1_qty'])
+        put_cols.extend(['bid_1_qty', 'ask_1_qty'])
+        call_rename.update({
+            'bid_1_qty': 'call_bid_qty',
+            'ask_1_qty': 'call_ask_qty',
+        })
+        put_rename.update({
+            'bid_1_qty': 'put_bid_qty',
+            'ask_1_qty': 'put_ask_qty',
+        })
+    
+    lf_calls = lf.filter(pl.col('opt_type') == 'C').select(call_cols).rename(call_rename)
+    lf_puts = lf.filter(pl.col('opt_type') == 'P').select(put_cols).rename(put_rename)
+    return lf_calls.join(lf_puts, on=['timeMs', 'expiry', 'strike'], how='inner')
+
 def _format_cache_value(value) -> str:
     """Format parameter value for cache name (e.g., 5.0 -> '5.0', '5m' -> '5m')."""
     if isinstance(value, float):

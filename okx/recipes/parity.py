@@ -84,7 +84,7 @@ def calculate_parity_arbitrage(
     
     NOTE: Assets and Volume bounds for options fee table are in USD, while the futures fee table bounds are in EUR.
           For now, we're ignoring this discrepancy.
-          
+
     Args:
         lf: LazyFrame from prepare_market_snapshots
         assets: Account assets in USD for options and futures fee tiers
@@ -107,14 +107,6 @@ def calculate_parity_arbitrage(
         print(f"  {options_tier:>8} options fees: maker={options_maker_fee:.4%}, taker={options_taker_fee:.4%}")
         print(f"  {futures_tier:>8} futures fees: maker={futures_maker_fee:.4%}, taker={futures_taker_fee:.4%}")
     
-    # Convert option prices from BTC to USD
-    lf = lf.with_columns([
-        (pl.col('call_bid') * pl.col('BTC-USD')).alias('call_bid_usd'),
-        (pl.col('call_ask') * pl.col('BTC-USD')).alias('call_ask_usd'),
-        (pl.col('put_bid') * pl.col('BTC-USD')).alias('put_bid_usd'),
-        (pl.col('put_ask') * pl.col('BTC-USD')).alias('put_ask_usd'),
-    ])
-    
     # Define synthetic order types: (name, direction, call_order, put_order, description)
     order_defs = [
         # LONG synthetics (buy call, sell put)
@@ -132,41 +124,61 @@ def calculate_parity_arbitrage(
     # Calculate synthetic forwards and arbitrage for each order type
     columns = []
     
+    option_tick = 0.0001
+    contract_multiplier = 0.01 if inst_family == 'BTC-USD' else 0.1
+    inverse_multiplier = 100 if inst_family == 'BTC-USD' else 10
+    # If order is maker, we must add/subtract one tick to be at the top of the order book.
+    # If order is taker, we are limited in size by the qty of the top bid/ask.
+    # If the order is maker, we take qty to be inverse_multiplier contracts.
     for name, direction, call_order, put_order, description in order_defs:
         # Select prices based on order type
         if direction == 'long':
-            call_px = 'call_bid_usd' if call_order == 'maker' else 'call_ask_usd'
-            put_px = 'put_ask_usd' if put_order == 'maker' else 'put_bid_usd'
-            call_qty = 'call_bid_qty' if call_order == 'maker' else 'call_ask_qty'
-            put_qty = 'put_ask_qty' if put_order == 'maker' else 'put_bid_qty'
+            call_px = (pl.col('call_bid_px') + option_tick) if call_order == 'maker' else pl.col('call_ask_px') # Buy call
+            put_px = (pl.col('put_ask_px') - option_tick) if put_order == 'maker' else pl.col('put_bid_px') # Sell put
+            call_qty = inverse_multiplier if call_order == 'maker' else pl.col('call_ask_qty')
+            put_qty = inverse_multiplier if put_order == 'maker' else pl.col('put_bid_qty')
             call_fee_rate = options_maker_fee if call_order == 'maker' else options_taker_fee
             put_fee_rate = options_maker_fee if put_order == 'maker' else options_taker_fee
         else:  # short
-            call_px = 'call_ask_usd' if call_order == 'maker' else 'call_bid_usd'
-            put_px = 'put_bid_usd' if put_order == 'maker' else 'put_ask_usd'
-            call_qty = 'call_ask_qty' if call_order == 'maker' else 'call_bid_qty'
-            put_qty = 'put_bid_qty' if put_order == 'maker' else 'put_ask_qty'
+            call_px = (pl.col('call_ask_px') - option_tick) if call_order == 'maker' else pl.col('call_bid_px') # Sell call
+            put_px = (pl.col('put_bid_px') + option_tick) if put_order == 'maker' else pl.col('put_ask_px') # Buy put
+            call_qty = inverse_multiplier if call_order == 'maker' else pl.col('call_bid_qty')
+            put_qty = inverse_multiplier if put_order == 'maker' else pl.col('put_ask_qty')
             call_fee_rate = options_maker_fee if call_order == 'maker' else options_taker_fee
             put_fee_rate = options_maker_fee if put_order == 'maker' else options_taker_fee
         
-        # Calculate synthetic forward using put-call parity
-        call_amt = pl.col(call_px)
-        put_amt = pl.col(put_px)
+        # Convert prices to USD
+        call_amt = call_px * pl.col('BTC-USD')
+        put_amt = put_px * pl.col('BTC-USD')
         
+        # Position size (limited by option liquidity, in units of contracts)
+        position_size = pl.min_horizontal(call_qty, put_qty)
+        
+        # Currently assuming quoted prices are for one contract.
+        # It's possible that this is not the case, and we will need to handle contract multipliers differently.
+        # Lines affected by this assumption are denoted with # <---
+
+        # Calculate option fees in USD, accounting for position size
+        option_fees = (call_amt * call_fee_rate + put_amt * put_fee_rate) * position_size # <---
+
+        # Calculate net premium per contract (in USD)
+        if direction == 'long':
+            net_premium = (call_amt - put_amt) # <---
+        else:
+            net_premium = (put_amt - call_amt) # <---
+        
+        # Calculated synthetic forwards prices
+        # Quoted synthetic prices multiply premiums by inverse_multiplier, as premiums are quoted in units of contracts.
         if direction == 'long':
             # F_synthetic = K + (C - P)
-            synth_fwd = pl.col('strike') + (call_amt - put_amt)
+            synth_fwd = pl.col('strike') + net_premium * inverse_multiplier # <---
         else:
             # F_synthetic = K - (P - C) for short
-            synth_fwd = pl.col('strike') - (put_amt - call_amt)
-        
-        # Calculate option fees
-        call_fee = call_amt * call_fee_rate
-        put_fee = put_amt * put_fee_rate
-        option_fees = call_fee + put_fee
-        
-        # Position size (limited by option liquidity, in BTC)
-        position_size = pl.min_horizontal(pl.col(call_qty), pl.col(put_qty))
+            synth_fwd = pl.col('strike') - net_premium * inverse_multiplier # <---
+
+        """
+        Left off here:
+        """
         
         # Calculate arbitrage metrics
         if direction == 'long':

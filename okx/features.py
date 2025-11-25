@@ -122,6 +122,10 @@ def _bin(lf: pl.LazyFrame, time_bins: pl.Series, interval: int, count: bool = Fa
     )
     # Step 2: Forward fill if requested (create per-symbol grids based on actual trading ranges)
     if ff:
+        # Convert nulls to 0 so forward fill only propagates structural nulls (missing bins),
+        # not data nulls (quotes that disappeared). Zeros will be converted back to nulls later.
+        binned = binned.with_columns(pl.all().fill_null(0))
+        
         # Get per-symbol time ranges
         symbol_ranges = (
             binned

@@ -122,7 +122,7 @@ class OrderbookStore:
             return pl.LazyFrame()
         
         # Raw data is sorted by timeMs (enforced at populate time)
-        return pl.scan_parquet(paths).set_sorted('timeMs')
+        return pl.scan_parquet(paths)
 
     def _write_cache(self, lf: pl.LazyFrame, dates: list[date], cache_name: str,
                      inst_family: str, inst_type: str) -> None:
